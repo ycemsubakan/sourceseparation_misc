@@ -10,6 +10,7 @@ import pdb
 import matplotlib.pyplot as plt
 from drawnow import drawnow, figure
 import torch.utils.data as data_utils
+from itertools import islice
 
 class netG(nn.Module):
     def __init__(self, ngpu):
@@ -50,7 +51,7 @@ class net_separation(nn.Module):
         return out1+out2, out1, out2
 
 
-def adverserial_trainer(train_loader, generator, discriminator, EP = 5):
+def adverserial_trainer(loader_mix, train_loader, generator, discriminator, EP = 5):
 
     def drawgendata():
         I = 4
@@ -72,7 +73,7 @@ def adverserial_trainer(train_loader, generator, discriminator, EP = 5):
     figure(figsize=(4,4))
     true, false = 1, 0
     for ep in range(EP):
-        for ft, tar in train_loader:
+        for (ft, _), (mix, _) in zip(train_loader, loader_mix):
 
             ft_rshape = ft.view(-1, L)
             # discriminator gradient with real data
@@ -83,7 +84,8 @@ def adverserial_trainer(train_loader, generator, discriminator, EP = 5):
             err_D_real.backward()
 
             # discriminator gradient with generated data
-            out_g = generator.forward(Variable(fixed_noise[:ft.size(0)]))
+            mix_rshape = mix.view(-1, L)
+            out_g = generator.forward(Variable(mix_rshape[:ft.size(0)]))
             out_d_g = discriminator.forward(out_g)
             labels = Variable(torch.ones(ft.size(0))*false).squeeze().float()
             err_D_fake = criterion(out_d_g, labels) 
@@ -195,6 +197,7 @@ test_loader = torch.utils.data.DataLoader(
 
 loader1, loader2, loader_mix = form_mixtures(0, 1, train_loader, args)
 
+
 K = 100
 ngpu = 1
 L = 28*28
@@ -203,69 +206,59 @@ L = 28*28
 generator1 = netG(ngpu)
 discriminator1 = netD(ngpu)
 
-generator2 = netG(ngpu)
-discriminator2 = netD(ngpu)
-
 criterion = nn.BCELoss()
 fixed_noise = torch.FloatTensor(args.batch_size, L).normal_(0, 1)
 
-EP = 10
-adverserial_trainer(train_loader=loader1,
+EP = 5
+adverserial_trainer(loader_mix=loader_mix,
+                    train_loader=loader1,
                     generator=generator1, 
                     discriminator=discriminator1, 
-                    EP=EP)
-adverserial_trainer(train_loader=loader2,
-                    generator=generator2, 
-                    discriminator=discriminator2, 
                     EP=EP)
 
 ###
 EP = 500
 x1hat, x2hat = [], []
 mixes = []
-for i, (mix, _ ) in enumerate(loader_mix[1]): 
+for i, (mix, _ ) in enumerate(islice(loader_mix,0,1,1)): 
+    mix = mix[:20]
 
     print('Processing source ',i)
     Nmix = mix.size(0)
+    mix_rshape = mix.view(Nmix, L)
 
     x1 = Variable(torch.rand(Nmix, L), requires_grad=True)
-    x2 = Variable(torch.rand(Nmix, L), requires_grad=True)
 
-    optimizer_sourcesep = optim.Adam([x1, x2], lr=1e-3, betas=(0.5, 0.999))
+    optimizer_sourcesep = optim.Adam([x1], lr=1e-3, betas=(0.5, 0.999))
     for ep in range(EP):
        
-        mix_sum = generator1.forward(x1) + generator2.forward(x2) 
-        err = torch.mean((Variable(mix) - mix_sum)**2)
+        mix_sum = generator1.forward(x1) 
+        err = torch.mean((Variable(mix_rshape) - mix_sum)**2)
 
         err.backward()
 
         optimizer_sourcesep.step()
 
         x1.grad.data.zero_()
-        x2.grad.data.zero_()
 
         print('Step in batch [{:d}\{:d}]'.format(ep+1, EP))
         print('The error is ', err)
-    x1hat.append(generator1.forward(x1).data.numpy())
-    x2hat.append(generator2.forward(x2).data.numpy())
+    x1hat.append(generator1.forward(Variable(mix_rshape)).data.numpy())
     mixes.append(mix.numpy())
 
 num_ims = 6
 sqrtL = int(np.sqrt(L))
 for i in range(num_ims):
-    plt.subplot(num_ims, 3, 3*i + 1)
-    plt.imshow(x1hat[i][0].reshape(sqrtL, sqrtL))
-    plt.title('Estimated Source 1')
+    plt.subplot(num_ims, 2, 2*i + 1)
+    plt.imshow(x1hat[0][i].reshape(sqrtL, sqrtL))
+    plt.title('Estimated Source ')
 
-    plt.subplot(num_ims, 3, 3*i + 2)
-    plt.imshow(x2hat[i][0].reshape(sqrtL, sqrtL))
-    plt.title('Estimated Source 2')
 
-    plt.subplot(num_ims, 3, 3*i + 3)
-    plt.imshow(mixes[i][0].reshape(sqrtL, sqrtL))
+    plt.subplot(num_ims, 2, 2*i + 2)
+    plt.imshow(mixes[0][i].reshape(sqrtL, sqrtL))
     plt.title('Mixture')
 
 
-plt.savefig('mnist_gan_sourceseperation.png')
+#plt.savefig('mnist_gan_sourceseperation.png')
 
 ####
