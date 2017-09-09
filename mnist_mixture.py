@@ -34,29 +34,41 @@ parser.add_argument('--log-interval', type=int, default=10, metavar='N',
 
 arguments = parser.parse_args()
 arguments.cuda = not arguments.no_cuda and torch.cuda.is_available()
+arguments.input_type = 'noise'
+arguments.L1 = 500
+arguments.L2 = 28*28
+arguments.K = 200
+arguments.smooth_output = True
 
 torch.manual_seed(arguments.seed)
 if arguments.cuda:
     torch.cuda.manual_seed(arguments.seed)
 
+asd = torch.rand(1)
+
 batch_size = 1000
 data = 'mnist'
-tr_method = 'adversarial'
+tr_method = 'ML'
 loss = 'Poisson'
 
 train_loader, test_loader = get_loaders(data, batch_size, arguments=arguments)
-
 loader1, loader2, loader_mix = form_mixtures(0, 1, train_loader, arguments)
 
-K = 100
+#asd = list(loader1)[0][0]
+
 ngpu = 1
-L = 28*28
+L1 = arguments.L1
+L2 = arguments.L2
+K = arguments.K
+smooth_output = arguments.smooth_output
 
-generator1 = netG(ngpu, K=K, L=L)
-discriminator1 = netD(ngpu, K=K, L=L)
+generator1 = netG(ngpu, K=K, L1=L1, L2=L2, smooth_output=smooth_output)
+discriminator1 = netD(ngpu, K=K, L=L2)
 
-generator2 = netG(ngpu, K=K, L=L)
-discriminator2 = netD(ngpu, K=K, L=L)
+generator2 = netG(ngpu, K=K, L1=L1, L2=L2, smooth_output=smooth_output)
+discriminator2 = netD(ngpu, K=K, L=L2)
+
+#asd = list(generator1.parameters())[0]
 
 if arguments.cuda:
     generator1.cuda()
@@ -65,12 +77,12 @@ if arguments.cuda:
     generator2.cuda()
     discriminator2.cuda()
 
-fixed_noise = torch.FloatTensor(arguments.batch_size, L).normal_(0, 1)
-if arguments.cuda:
-    fixed_noise = fixed_noise.cuda()
+#fixed_noise = torch.FloatTensor(arguments.batch_size, L).normal_(0, 1)
+#if arguments.cuda:
+#    fixed_noise = fixed_noise.cuda()
 
 # Train the generative models for the sources
-EP = 20
+EP = 40
 if tr_method == 'adversarial':
     criterion = nn.BCELoss()
     adverserial_trainer(loader_mix=loader_mix,
@@ -80,7 +92,6 @@ if tr_method == 'adversarial':
                         EP=EP,
                         arguments=arguments,
                         criterion=criterion,
-                        fixed_noise=fixed_noise,
                         conditional_gen=False)
 
     adverserial_trainer(loader_mix=loader_mix,
@@ -90,7 +101,6 @@ if tr_method == 'adversarial':
                         EP=EP,
                         arguments=arguments,
                         criterion=criterion,
-                        fixed_noise=fixed_noise,
                         conditional_gen=False)
 elif tr_method == 'ML':
     if loss == 'Euclidean': 
@@ -104,19 +114,22 @@ elif tr_method == 'ML':
                        EP=EP,
                        arguments=arguments,
                        criterion=criterion,
-                       fixed_noise=fixed_noise,
                        conditional_gen=False)
-
     generative_trainer(loader_mix=loader_mix,
                        train_loader=loader2,
                        generator=generator2, 
                        EP=EP,
                        arguments=arguments,
                        criterion=criterion,
-                       fixed_noise=fixed_noise,
                        conditional_gen=False)
 
- 
+
+check1 = generator1.parameters().next()
+print('Sum of generator1 parameters is:', check1.sum())
+
+check2 = generator2.parameters().next()
+print('Sum of generator2 parameters is:', check2.sum())
+
 
 ###
 
