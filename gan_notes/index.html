@@ -6,7 +6,6 @@
   <meta name="generator" content="pandoc" />
   <title></title>
   <style type="text/css">code{white-space: pre;}</style>
-  <script src="https://cdn.mathjax.org/mathjax/latest/MathJax.js?config=TeX-AMS_CHTML-full" type="text/javascript"></script>
 </head>
 <body>
 <h1 id="simple-mnist-experiments">Simple MNIST experiments:</h1>
@@ -24,20 +23,34 @@
 </ul>
 <h1 id="update-09-september-2017">update: (09 September 2017)</h1>
 <ul>
-<li>I have added a convolution layer at the end of 1 hidden layer perceptron. The generator network is like this:
-<span class="math display">\[\begin{align}
+<li><p>I have added a convolution layer at the end of 1 hidden layer perceptron. The generator network is like this: <br /><img style="vertical-align:middle" src="http://chart.apis.google.com/chart?cht=tx&amp;chl=%0A%5Cbegin%7Balign%7D%0Ah%5E1%20%3D%26%20%5Ctanh%28%20W%5E1%20x%29%2C%20%5C%5C%0Ah%5E2%20%3D%26%20%5Ctext%7BSoftPlus%7D%20%28W%5E2%20h%5E1%29%2C%20%5C%5C%0Ay%20%3D%20%26%20%5Ctext%7BSoftPlus%7D%20%28W%5E3%20%2A%20h_2%29%2C%0A%5Cend%7Balign%7D%0A" alt="
+\begin{align}
 h^1 =&amp; \tanh( W^1 x), \\
 h^2 =&amp; \text{SoftPlus} (W^2 h^1), \\
 y = &amp; \text{SoftPlus} (W^3 * h_2),
-\end{align}\]</span>
-<p>where I used 500 dimensional random noise for the input. <span class="math inline">\(h^1, h^2\)</span> are respectively 200 and 784 dimensional. At the last layer the convolution mask is 5x5.</p></li>
-<li>The discriminator network is this:
-<span class="math display">\[\begin{align}
+\end{align}
+" title="
+\begin{align}
+h^1 =&amp; \tanh( W^1 x), \\
+h^2 =&amp; \text{SoftPlus} (W^2 h^1), \\
+y = &amp; \text{SoftPlus} (W^3 * h_2),
+\end{align}
+" /><br /> where I used 500 dimensional random noise for the input. <img style="vertical-align:middle" src="http://chart.apis.google.com/chart?cht=tx&amp;chl=h%5E1%2C%20h%5E2" alt="h^1, h^2" title="h^1, h^2" /> are respectively 200 and 784 dimensional. At the last layer the convolution mask is 5x5.</p></li>
+<li>The discriminator network is this: <br /><img style="vertical-align:middle" src="http://chart.apis.google.com/chart?cht=tx&amp;chl=%0A%5Cbegin%7Balign%7D%0Ah%5E1%20%3D%26%20%5Ctanh%28%20W%5E1%20x%29%2C%20%5C%5C%0Ay%20%3D%26%20%5Ctext%7BSigmoid%7D%28%28w%5E2%29%5E%5Ctop%20h%5E1%29%2C%0A%5Cend%7Balign%7D%0A" alt="
+\begin{align}
 h^1 =&amp; \tanh( W^1 x), \\
 y =&amp; \text{Sigmoid}((w^2)^\top h^1),
-\end{align}\]</span>
-where the output is a scalar between 0 and 1.</li>
-<li><p>The results look like the following now: (In both cases I am mapping 500 dimensional random noise to the images) I am first showing <strong>Adversarial</strong> then <strong>Maximum Likelihood</strong>. It seems like using a convolutive output layer alleviates the noise problem in the digit textures. And, it still seems like GAN separation results are cleaner in terms of interference/artifacts. <img src="../figures/mnist_adversarial_conditional_False_smooth_output_True_sourceseparation.png" width="500"> <img src="../figures/mnist_ML_conditional_False_smooth_output_True_sourceseparation.png" width="500"></p></li>
+\end{align}
+" title="
+\begin{align}
+h^1 =&amp; \tanh( W^1 x), \\
+y =&amp; \text{Sigmoid}((w^2)^\top h^1),
+\end{align}
+" /><br /> where the output is a scalar between 0 and 1.</li>
+<li>The results look like the following now: (In both cases I am mapping 500 dimensional random noise to the images) I am first showing <strong>Adversarial</strong> then <strong>Maximum Likelihood</strong>. It seems like using a convolutive output layer alleviates the noise problem in the digit textures. And, it still seems like GAN separation results are cleaner in terms of interference/artifacts.
+<p style="text-align:left">
+<img src="../figures/mnist_adversarial_conditional_False_smooth_output_True_sourceseparation.png" width="300"> <img src="../figures/mnist_ML_conditional_False_smooth_output_True_sourceseparation.png" width="300">
+</p></li>
 </ul>
 <h2 id="things-to-try-next">Things to try next:</h2>
 <ul>
