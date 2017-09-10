@@ -340,7 +340,7 @@ def maxlikelihood_separatesources(generators, loader_mix, EP, **kwargs):
         mixes.append(mix.cpu().numpy())
 
     print('sum is:', x1hat[0].sum())
-    num_ims, c = 10, 2
+    num_ims, c = 30, 2
     figure(num=None, figsize=(3*c, num_ims*c), dpi=80, facecolor='w', edgecolor='k')
     sqrtL2 = int(np.sqrt(L2))
     for i in range(num_ims):

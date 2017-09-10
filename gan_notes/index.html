@@ -1,3 +1,14 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml">
+<head>
+  <meta http-equiv="Content-Type" content="text/html; charset=utf-8" />
+  <meta http-equiv="Content-Style-Type" content="text/css" />
+  <meta name="generator" content="pandoc" />
+  <title></title>
+  <style type="text/css">code{white-space: pre;}</style>
+  <script src="https://cdn.mathjax.org/mathjax/latest/MathJax.js?config=TeX-AMS_CHTML-full" type="text/javascript"></script>
+</head>
+<body>
 <h1 id="simple-mnist-experiments">Simple MNIST experiments:</h1>
 <ul>
 <li>Here's the ML vs GAN source separation figure:</li>
@@ -11,3 +22,27 @@
 <li>Try audio.</li>
 <li><p>Debug the version where the input is the mixture.</p></li>
 </ul>
+<h1 id="update-09-september-2017">update: (09 September 2017)</h1>
+<ul>
+<li>I have added a convolution layer at the end of 1 hidden layer perceptron. The generator network is like this:
+<span class="math display">\[\begin{align}
+h^1 =&amp; \tanh( W^1 x), \\
+h^2 =&amp; \text{SoftPlus} (W^2 h^1), \\
+y = &amp; \text{SoftPlus} (W^3 * h_2),
+\end{align}\]</span>
+<p>where I used 500 dimensional random noise for the input. <span class="math inline">\(h^1, h^2\)</span> are respectively 200 and 784 dimensional. At the last layer the convolution mask is 5x5.</p></li>
+<li>The discriminator network is this:
+<span class="math display">\[\begin{align}
+h^1 =&amp; \tanh( W^1 x), \\
+y =&amp; \text{Sigmoid}((w^2)^\top h^1),
+\end{align}\]</span>
+where the output is a scalar between 0 and 1.</li>
+<li><p>The results look like the following now: (In both cases I am mapping 500 dimensional random noise to the images) I am first showing <strong>Adversarial</strong> then <strong>Maximum Likelihood</strong>. It seems like using a convolutive output layer alleviates the noise problem in the digit textures. And, it still seems like GAN separation results are cleaner in terms of interference/artifacts. <img src="../figures/mnist_adversarial_conditional_False_smooth_output_True_sourceseparation.png" width="500"> <img src="../figures/mnist_ML_conditional_False_smooth_output_True_sourceseparation.png" width="500"></p></li>
+</ul>
+<h2 id="things-to-try-next">Things to try next:</h2>
+<ul>
+<li>Try variational autoencoders</li>
+<li>Start working on an audio dataset</li>
+</ul>
+</body>
+</html>

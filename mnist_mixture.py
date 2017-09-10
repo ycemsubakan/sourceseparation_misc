@@ -48,7 +48,7 @@ asd = torch.rand(1)
 
 batch_size = 1000
 data = 'mnist'
-tr_method = 'ML'
+tr_method = 'adversarial'
 loss = 'Poisson'
 
 train_loader, test_loader = get_loaders(data, batch_size, arguments=arguments)
