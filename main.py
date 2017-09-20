@@ -16,14 +16,14 @@ import utils as ut
 
 # Training settings
 parser = argparse.ArgumentParser(description='PyTorch MNIST Example')
-parser.add_argument('--batch-size', type=int, default=64, metavar='N',
+parser.add_argument('--batch_size', type=int, default=64, metavar='N',
                     help='input batch size for training (default: 64)')
 parser.add_argument('--test-batch-size', type=int, default=1000, metavar='N',
                     help='input batch size for testing (default: 1000)')
 parser.add_argument('--epochs', type=int, default=10, metavar='N',
                     help='number of epochs to train (default: 10)')
-parser.add_argument('--lr', type=float, default=0.01, metavar='LR',
-                    help='learning rate (default: 0.01)')
+parser.add_argument('--lr', type=float, default=0.001, metavar='LR',
+                    help='learning rate (default: 0.001)')
 parser.add_argument('--momentum', type=float, default=0.5, metavar='M',
                     help='SGD momentum (default: 0.5)')
 parser.add_argument('--no-cuda', action='store_true', default=False,
@@ -42,19 +42,18 @@ parser.add_argument('--save_files', type=int, default=1)
 parser.add_argument('--EP_train', type=int, default=400)
 parser.add_argument('--EP_test', type=int, default=2000)
 parser.add_argument('--save_records', type=int, default=1)
+parser.add_argument('--data', type=str, default='spoken_digits', help='spoken_digits or synthetic_sounds')
+parser.add_argument('--L1', type=int, default=200)
+parser.add_argument('--feat_match', type=int, default=0) 
+
 arguments = parser.parse_args()
 
 arguments.cuda = not arguments.no_cuda and torch.cuda.is_available()
-arguments.L1 = 200
-arguments.K = 200
 
 torch.manual_seed(arguments.seed)
 if arguments.cuda:
     torch.cuda.manual_seed(arguments.seed)
 
-
-batch_size = 1000
-data = 'mnist'
 tr_method = arguments.tr_method
 loss = 'Poisson'
 
@@ -71,7 +70,7 @@ elif arguments.task == 'spoken_digits':
     loader1, loader2, loader_mix = ut.form_spoken_digit_mixtures(digit1=0, digit2=1, arguments=arguments)
     arguments.smooth_output = False
 elif arguments.task == 'atomic_sourcesep':
-    loader1, loader2, loader_mix = ut.form_spoken_digit_mixtures(digit1=0, digit2=1, arguments=arguments)
+    loader1, loader2, loader_mix = ut.preprocess_audio_files(arguments=arguments)
     arguments.smooth_output = False
 else:
     raise ValueError('I do not know which task is that')
@@ -86,8 +85,6 @@ smooth_output = arguments.smooth_output
 
 generator1 = netG(ngpu, K=K, L1=L1, L2=L2, arguments=arguments)
 discriminator1 = netD(ngpu, K=K, L=L2, arguments=arguments)
-
-
 
 generator2 = netG(ngpu, K=K, L1=L1, L2=L2, arguments=arguments)
 discriminator2 = netD(ngpu, K=K, L=L2, arguments=arguments)
@@ -108,7 +105,30 @@ if arguments.cuda:
 # Train the generative models for the sources
 EP = arguments.EP_train
 if tr_method == 'adversarial':
+    #if loss == 'Euclidean': 
+    #    criterion = nn.MSELoss()
+    #elif loss == 'Poisson':
+    #    eps = 1e-20
+    #    criterion = lambda lam, tar: torch.mean(-tar*torch.log(lam+eps) + lam)
+
+    #generative_trainer(loader_mix=loader_mix,
+    #                   train_loader=loader2,
+    #                   generator=generator2, 
+    #                   EP=EP,
+    #                   arguments=arguments,
+    #                   criterion=criterion,
+    #                   conditional_gen=False)
+
     criterion = nn.BCELoss()
+    adversarial_trainer(loader_mix=loader_mix,
+                        train_loader=loader2,
+                        generator=generator2, 
+                        discriminator=discriminator2, 
+                        EP=EP,
+                        arguments=arguments,
+                        criterion=criterion,
+                        conditional_gen=False)
+    
     adversarial_trainer(loader_mix=loader_mix,
                         train_loader=loader1,
                         generator=generator1, 
@@ -118,14 +138,7 @@ if tr_method == 'adversarial':
                         criterion=criterion,
                         conditional_gen=False)
 
-    adversarial_trainer(loader_mix=loader_mix,
-                        train_loader=loader2,
-                        generator=generator2, 
-                        discriminator=discriminator2, 
-                        EP=EP,
-                        arguments=arguments,
-                        criterion=criterion,
-                        conditional_gen=False)
+
 elif tr_method == 'ML':
     if loss == 'Euclidean': 
         criterion = nn.MSELoss()

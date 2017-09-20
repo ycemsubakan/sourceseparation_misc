@@ -27,16 +27,17 @@ class netG(nn.Module):
     def __init__(self, ngpu, **kwargs):
         super(netG, self).__init__()
         self.ngpu = ngpu
-        pl = 40
+        pl = 0
         self.L1 = kwargs['L1']
         self.L2 = kwargs['L2']
         self.K = kwargs['K']
         self.arguments = kwargs['arguments']
         self.l1 = nn.Linear(self.L1, self.K+pl, bias=True)
         initializationhelper(self.l1, 'tanh')
+        self.l1_bn = nn.BatchNorm1d(self.K+pl)
 
         self.l2 = nn.Linear(self.K+pl, self.L2, bias=True) 
-        initializationhelper(self.l1, 'relu')
+        initializationhelper(self.l2, 'relu')
 
         self.smooth_output = self.arguments.smooth_output
         if self.smooth_output:
@@ -50,7 +51,7 @@ class netG(nn.Module):
         if not (type(inp) == Variable):
             inp = Variable(inp[0])
 
-        h = F.softplus(self.l1(inp))
+        h = F.softplus((self.l1(inp)))
         output = F.softplus(self.l2(h))
 
         if self.smooth_output:
@@ -69,10 +70,14 @@ class netD(nn.Module):
 
         self.l1 = nn.Linear(self.L, self.K, bias=True)
         initializationhelper(self.l1, 'tanh')
+        self.l1_bn = nn.BatchNorm1d(self.K)
 
-        self.l2 = nn.Linear(self.K, 1, bias=True) 
-        initializationhelper(self.l1, 'relu')
+        #self.l2 = nn.Linear(self.K, self.K, bias=True) 
+        #initializationhelper(self.l2, 'relu')
+        #self.l2_bn = nn.BatchNorm1d(self.K)
 
+        self.l3 = nn.Linear(self.K, 1, bias=True)
+        initializationhelper(self.l3, 'relu') 
 
     def forward(self, inp):
         #if inp.dim() > 2:
@@ -82,9 +87,12 @@ class netD(nn.Module):
         if not (type(inp) == Variable):
             inp = Variable(inp[0])
 
-        h = F.tanh(self.l1(inp))
-        output = F.sigmoid(self.l2(h))
-        return output
+        h1 = F.relu((self.l1(inp)))
+        
+        #h2 = F.tanh(self.l2_bn(self.l2(h1)))
+
+        output = F.sigmoid(self.l3(h1))
+        return output, h1
 
 def adversarial_trainer(loader_mix, train_loader, 
                         generator, discriminator, EP=5,
@@ -113,12 +121,11 @@ def adversarial_trainer(loader_mix, train_loader,
         I = 1
         N = 4 
         
-        genspec = out_g.data.numpy().transpose()
-        target = tar[0].numpy().transpose()
+        genspec = out_g.data.numpy().transpose()[:, :700]
+        target = tar[0].numpy().transpose()[:, :700]
 
         #genspec = out_g[].data.numpy().transpose()
         #target = tar.permute(0,2,1).contiguous().view(-1, L2).numpy().transpose()
-
         for i in range(I):
             plt.subplot(N, I, i+1)
             plt.imshow(genspec) 
@@ -137,11 +144,11 @@ def adversarial_trainer(loader_mix, train_loader,
     # end of drawnow function
 
     if arguments.optimizer == 'Adam':
-        optimizerD = optim.Adam(discriminator.parameters(), lr=1e-3, betas=(0.9, 0.999))
-        optimizerG = optim.Adam(generator.parameters(), lr=1e-3, betas=(0.9, 0.999))
+        optimizerD = optim.Adam(discriminator.parameters(), lr=arguments.lr, betas=(0.9, 0.999))
+        optimizerG = optim.Adam(generator.parameters(), lr=arguments.lr, betas=(0.9, 0.999))
     elif arguments.optimizer == 'RMSprop':
-        optimizerD = optim.RMSprop(discriminator.parameters(), lr=1e-3)
-        optimizerG = optim.RMSprop(generator.parameters(), lr=1e-3)
+        optimizerD = optim.RMSprop(discriminator.parameters(), lr=arguments.lr)
+        optimizerG = optim.RMSprop(generator.parameters(), lr=arguments.lr)
     else:
         raise ValueError('Whaaaat?')
 
@@ -161,7 +168,7 @@ def adversarial_trainer(loader_mix, train_loader,
 
             # discriminator gradient with real data
             discriminator.zero_grad()
-            out_d = discriminator.forward(tar)
+            out_d, _ = discriminator.forward(tar)
             labels = Variable(torch.ones(out_d.size(0))*true).squeeze().float()
             if arguments.cuda:
                 labels = labels.cuda()
@@ -175,7 +182,7 @@ def adversarial_trainer(loader_mix, train_loader,
             #    inp = ft_rshape # fixed_noise.contiguous().view(-1, L)
 
             out_g = generator.forward(ft)
-            out_d_g = discriminator.forward(out_g)
+            out_d_g, _ = discriminator.forward(out_g)
             labels = Variable(torch.ones(out_d.size(0))*false).squeeze().float()
             if arguments.cuda:
                 labels = labels.cuda()
@@ -195,11 +202,16 @@ def adversarial_trainer(loader_mix, train_loader,
 
             # generator gradient
             generator.zero_grad()
-            out_d_g = discriminator.forward(out_g)
-            labels = Variable(torch.ones(out_d.size(0))*true).squeeze().float()
-            if arguments.cuda:
-                labels = labels.cuda()
-            err_G = criterion(out_d_g, labels)
+            if arguments.feat_match:
+                _, out_h_data = discriminator.forward(tar)    
+                _, out_h_g = discriminator.forward(out_g) 
+                err_G = ((out_h_data.mean(0) - out_h_g.mean(0))**2).sum()
+            else:
+                out_d_g, _ = discriminator.forward(out_g)
+                labels = Variable(torch.ones(out_d.size(0))*true).squeeze().float()
+                if arguments.cuda:
+                    labels = labels.cuda()
+                err_G = criterion(out_d_g, labels)
             err_G.backward()
 
             optimizerG.step()
@@ -238,9 +250,9 @@ def generative_trainer(loader_mix, train_loader,
         I = 1
         N = 5 
         
-        genspec = out_g.data.numpy().transpose()
-        target = tar[0].numpy().transpose()
-        feat = ft[0].numpy().transpose()
+        genspec = out_g.data.numpy().transpose()[:, :200]
+        target = tar[0].numpy().transpose()[:, :200]
+        feat = ft[0].numpy().transpose()[:, :200]
 
 
         #genspec = out_g[].data.numpy().transpose()
@@ -263,9 +275,9 @@ def generative_trainer(loader_mix, train_loader,
             lrd.specshow(feat, y_axis='log', x_axis='time')
 
     if arguments.optimizer == 'Adam':
-        optimizerG = optim.Adam(generator.parameters(), lr=1e-3, betas=(0.9, 0.999))
+        optimizerG = optim.Adam(generator.parameters(), lr=arguments.lr, betas=(0.9, 0.999))
     elif arguments.optimizer == 'RMSprop':
-        optimizerG = optim.RMSprop(generator.parameters(), lr=1e-3)
+        optimizerG = optim.RMSprop(generator.parameters(), lr=arguments.lr)
 
     if not arguments.cuda:
         figure(figsize=(4,4))
@@ -451,8 +463,11 @@ def ML_separate_audio_sources(generators, loader_mix, EP, **kwargs):
         s2s.extend(np.split(wavfls2.cpu().numpy(), Nmix, 0))
 
     curdir = os.getcwd() 
-    magpath = os.path.join(curdir, '_'.join(['spectrograms', arguments.tr_method]))
-    soundpath = os.path.join(curdir, '_'.join(['sounds', arguments.tr_method])) 
+    exp_info = '_'.join([arguments.tr_method, arguments.data, 
+                         arguments.input_type, arguments.optimizer, 
+                         'feat_match', str(arguments.feat_match)])
+    magpath = os.path.join(curdir, '_'.join(['spectrograms', exp_info]))
+    soundpath = os.path.join(curdir, '_'.join(['sounds', exp_info]))
     
     if not os.path.exists(magpath):
         os.mkdir(magpath)
@@ -512,6 +527,6 @@ def ML_separate_audio_sources(generators, loader_mix, EP, **kwargs):
     bss_df = ut.compile_bssevals(bss_evals) 
 
     if arguments.save_records:
-        bss_df.to_csv(os.path.join(recordspath, 'bss_evals_' + arguments.tr_method + '.csv' ))
+        bss_df.to_csv(os.path.join(recordspath, '_'.join(['bss_evals', exp_info]) + '.csv' ))
 
 

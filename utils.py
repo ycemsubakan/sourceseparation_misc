@@ -27,7 +27,6 @@ def audio_to_bsseval(s1hats, s2hats, s1s, s2s):
     bss_evals = []
     for i, (s1hat, s2hat, s1, s2) in enumerate(zip(s1hats, s2hats, s1s, s2s)):
 
-        pdb.set_trace()
         print('Computing bssevals for mixture {}'.format(i))
 
         sourcehat_mat = np.concatenate([s1hat.reshape(1, -1), s2hat.reshape(1, -1)], 0)
@@ -131,30 +130,45 @@ def sort_pack_tensors(ft, tar, lens):
     return ft_packed, tar_packed
 
 
-def form_spoken_digit_mixtures(digit1, digit2, arguments):
 
-    path = os.getcwd().replace('someplaying_around', 'free-spoken-digit-dataset') 
-    audio_path = os.path.join(path, 'recordings')
-    spect_path = os.path.join(path, 'spectrograms')
+def preprocess_audio_files(arguments):
+    '''preprocess audio files to form mixtures 
+    and training sequences'''
 
-    files = os.listdir(audio_path)
-    files_digit1 = [fl for fl in files if str(digit1)+'_' in fl]
-    files_digit2 = [fl for fl in files if str(digit2)+'_' in fl]
+    if arguments.data == 'synthetic_sounds':
+        audio_path = os.getcwd().replace('someplaying_around', 
+                                         'generated_sounds_43_71_35_43_64_73') 
+        arguments.K = 200
 
-    N1, N2 = len(files_digit1), len(files_digit2)
-    N = min([N1, N2])
-    files_digit1, files_digit2 = files_digit1[:N], files_digit2[:N]
+        files = os.listdir(audio_path)
+        files_source1 = [fl for fl in files if 'source1' in fl]
+        files_source2 = [fl for fl in files if 'source2' in fl]
+        #files_mixture = [fl for fl in files if 'mixture' in fl]
+    elif arguments.data == 'spoken_digits':
+        digit1, digit2 = 0, 1
+
+        path = os.getcwd().replace('someplaying_around', 'free-spoken-digit-dataset') 
+        audio_path = os.path.join(path, 'recordings')
+        arguments.K = 200
+
+        files = os.listdir(audio_path)
+        files_source1 = [fl for fl in files if str(digit1)+'_' in fl]
+        files_source2 = [fl for fl in files if str(digit2)+'_' in fl]
+
+        N1, N2 = len(files_source1), len(files_source2)
+        N = min([N1, N2])
+        files_source1, files_source2 = files_source1[:N], files_source2[:N]
 
     # first load the files and append zeros
     SPCS1abs, SPCS2abs, MSabs = [], [], []
     SPCS1phase, SPCS2phase, MSphase = [], [], [] 
     wavfls1, wavfls2 = [], []
     lens1, lens2 = [], []
-    for i, (fl1, fl2) in enumerate(zip(files_digit1, files_digit2)):
+    for i, (fl1, fl2) in enumerate(zip(files_source1, files_source2)):
         wavfl1, fs = lr.load(os.path.join(audio_path, fl1))
         wavfl2, fs = lr.load(os.path.join(audio_path, fl2))
         wavfls1.append(wavfl1), wavfls2.append(wavfl2)
-        
+
         SPC1 = lr.core.stft(wavfl1, n_fft=1024).transpose()
         SPC2 = lr.core.stft(wavfl2, n_fft=1024).transpose()
 
