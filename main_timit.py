@@ -45,7 +45,7 @@ parser.add_argument('--save_files', type=int, default=1)
 parser.add_argument('--EP_train', type=int, default=400)
 parser.add_argument('--EP_test', type=int, default=2000)
 parser.add_argument('--save_records', type=int, default=1)
-parser.add_argument('--data', type=str, default='spoken_digits', help='spoken_digits or synthetic_sounds')
+parser.add_argument('--data', type=str, default='TIMIT', help='spoken_digits or synthetic_sounds')
 parser.add_argument('--L1', type=int, default=200)
 parser.add_argument('--feat_match', type=int, default=0) 
 parser.add_argument('--load_models', type=int, default=0)
@@ -59,29 +59,13 @@ arguments.cuda = not arguments.no_cuda and torch.cuda.is_available()
 torch.manual_seed(arguments.seed)
 if arguments.cuda:
     torch.cuda.manual_seed(arguments.seed)
+np.random.seed(arguments.seed)
 
 tr_method = arguments.tr_method
 loss = 'Poisson'
 
-if arguments.task == 'mnist':
-    train_loader, test_loader = get_loaders(data, batch_size, arguments=arguments)
-    loader1, loader2, loader_mix = form_mixtures(0, 1, train_loader, arguments)
+loader1, loader2, loader_mix = ut.preprocess_timit_files(arguments) 
 
-    arguments.smooth_output = True
-    arguments.L2 = 28*28
-    arguments.nfts = 28
-    arguments.T = 28
-
-elif arguments.task == 'spoken_digits':
-    loader1, loader2, loader_mix = ut.form_spoken_digit_mixtures(digit1=0, digit2=1, arguments=arguments)
-    arguments.smooth_output = False
-elif arguments.task == 'atomic_sourcesep':
-    loader1, loader2, loader_mix = ut.preprocess_audio_files(arguments=arguments)
-    arguments.smooth_output = False
-else:
-    raise ValueError('I do not know which task is that')
-
-#asd = list(loader1)[0][0]
 exp_info = '_'.join([arguments.tr_method,
                      arguments.test_method,
                      arguments.data, 
@@ -103,18 +87,12 @@ generator2 = netG(ngpu, K=K, L1=L1, L2=L2, arguments=arguments)
 discriminator1 = netD(ngpu, K=K, L=L2, arguments=arguments)
 discriminator2 = netD(ngpu, K=K, L=L2, arguments=arguments)
 
-#asd = list(generator1.parameters())[0]
-
 if arguments.cuda:
     generator1.cuda()
     discriminator1.cuda()
 
     generator2.cuda()
     discriminator2.cuda()
-
-#fixed_noise = torch.FloatTensor(arguments.batch_size, L).normal_(0, 1)
-#if arguments.cuda:
-#    fixed_noise = fixed_noise.cuda()
 
 # Train the generative models for the sources
 if arguments.load_models:
@@ -128,16 +106,7 @@ else:
     EP = arguments.EP_train
     if tr_method == 'adversarial':
         criterion = nn.BCELoss()
-        
-        adversarial_trainer(loader_mix=loader_mix,
-                            train_loader=loader2,
-                            generator=generator2, 
-                            discriminator=discriminator2, 
-                            EP=EP,
-                            arguments=arguments,
-                            criterion=criterion,
-                            conditional_gen=False)
-        
+                
         adversarial_trainer(loader_mix=loader_mix,
                             train_loader=loader1,
                             generator=generator1, 
@@ -146,6 +115,16 @@ else:
                             arguments=arguments,
                             criterion=criterion,
                             conditional_gen=False)
+
+        adversarial_trainer(loader_mix=loader_mix,
+                            train_loader=loader2,
+                            generator=generator2, 
+                            discriminator=discriminator2, 
+                            EP=EP,
+                            arguments=arguments,
+                            criterion=criterion,
+                            conditional_gen=False)
+
 
 
     elif tr_method == 'ML':
@@ -177,57 +156,38 @@ else:
     ut.save_models([generator1, generator2], [discriminator1, discriminator2], 
                     exp_info, savepath, arguments)
 
-#check1 = generator1.parameters().next()
-#print('Sum of generator1 parameters is:', check1.sum())
-#
-#check2 = generator2.parameters().next()
-#print('Sum of generator2 parameters is:', check2.sum())
-
-
-###
 
 # Separate out the sources 
-if arguments.task == 'mnist':
-    maxlikelihood_separatesources(generators=[generator1, generator2],
-                                  discriminators=[discriminator1, discriminator2],
-                                  loader_mix=loader_mix,
-                                  EP=arguments.EP_test,
-                                  arguments=arguments,
-                                  conditional=False,
-                                  data='mnist',
-                                  tr_method=tr_method,
-                                  loss=loss)
-elif arguments.task == 'atomic_sourcesep':
-    
-    if arguments.adjust_tradeoff: 
-        alpha_range = [0] + list(np.logspace(-8, 1, 10, base=2))
-    else:
-        alpha_range = [0.01]
-    
-    bss_evals = []
-    for alpha in alpha_range:
-        print('The current tradeoff parameter is {}'.format(alpha))
-        bss_eval = ML_separate_audio_sources(generators=[generator1, generator2],
-                                             discriminators=[discriminator1, discriminator2],
-                                             loader_mix=loader_mix,
-                                             EP=arguments.EP_test,
-                                             arguments=arguments,
-                                             conditional=False,
-                                             tr_method=tr_method,
-                                             loss=loss, alpha=float(alpha),
-                                             exp_info=exp_info)
-        bss_evals.append(bss_eval)
 
-    # only save the bss evals here if we adjust the tradeoff parameter
-    if arguments.adjust_tradeoff:
-        curdir = os.getcwd()
-        recordspath = os.path.join(curdir, 'records')
-        if not os.path.exists(recordspath):
-            os.mkdir(recordspath)
+if arguments.adjust_tradeoff: 
+    alpha_range = [0] + list(np.logspace(-8, 1, 10, base=2))
+else:
+    alpha_range = [0.0625]
 
-        bss_evals_path = os.path.join(recordspath, '_'.join(['bss_evals_all', exp_info]) + '.pk')
-        pickle.dump({'alpha_range': alpha_range, 'bss_evals': bss_evals}, 
-                    open(bss_evals_path, 'w')) 
+bss_evals = []
+for alpha in alpha_range:
+    print('The current tradeoff parameter is {}'.format(alpha))
+    bss_eval = ML_separate_audio_sources(generators=[generator1, generator2],
+                                         discriminators=[discriminator1, discriminator2],
+                                         loader_mix=loader_mix,
+                                         EP=arguments.EP_test,
+                                         arguments=arguments,
+                                         conditional=False,
+                                         tr_method=tr_method,
+                                         loss=loss, alpha=float(alpha),
+                                         exp_info=exp_info)
+    bss_evals.append(bss_eval)
+
+# only save the bss evals here if we adjust the tradeoff parameter
+if arguments.adjust_tradeoff:
+    curdir = os.getcwd()
+    recordspath = os.path.join(curdir, 'records')
+    if not os.path.exists(recordspath):
+        os.mkdir(recordspath)
+
+    bss_evals_path = os.path.join(recordspath, '_'.join(['bss_evals_all', exp_info]) + '.pk')
+    pickle.dump({'alpha_range': alpha_range, 'bss_evals': bss_evals}, 
+                open(bss_evals_path, 'w')) 
 
 
 # python main.py --optimizer RMSprop --tr_method adversarial --input_type noise --save_files 0 --save_records 0 --L1 512 --EP_train 400 --feat_match 1 --data synthetic_sounds --batch_size 20 --test_method optimize --load_model 0 --adjust_tradeoff 1

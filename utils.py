@@ -8,6 +8,62 @@ import os
 import torch.nn.init as torchinit
 import mir_eval.separation as mevalsep 
 import pandas as pd
+from torchvision import datasets, transforms
+import matplotlib.pyplot as plt
+import timit_utilities as tu
+import scipy as sp
+import sklearn as skt
+
+def prepare_mixture_gm_data(arguments):
+    dataset = []
+    
+    num_means = 1
+    arguments.L2 = 2
+    arguments.L1 = 2
+    arguments.K = 50
+    sig0 = 5
+    sig = 0.1
+
+    means = 5*torch.randn(num_means, arguments.L2) 
+    arguments.means = means.numpy()
+
+    N = 2000
+
+    mixinds = torch.multinomial(torch.ones(num_means), N, replacement=True) 
+    obsnoise = torch.randn(N, arguments.L2) 
+
+    data = means[mixinds] + obsnoise
+    inp = torch.randn(N, arguments.L1) 
+
+    dataset1 = TensorDataset(inp, data, [1]*N)
+    datasetmix = dataset1 
+
+    kwargs = {'num_workers': 1, 'pin_memory': True} if arguments.cuda else {}
+    loader1 = data_utils.DataLoader(dataset1, batch_size=arguments.batch_size, shuffle=False, **kwargs)
+    loader_mix = data_utils.DataLoader(datasetmix, batch_size=arguments.batch_size, shuffle=False, **kwargs)
+
+    return loader1, loader_mix
+   
+
+def save_image_samples(samples, save_path, exp_info, mode, arguments):
+    N = len(samples)
+    sqrtN = int(np.sqrt(N))
+    for n, sample in enumerate(samples):
+        plt.subplot(sqrtN, sqrtN, n+1)
+        sample = sample.contiguous().view(arguments.nfts, arguments.T)
+        plt.imshow(sample.cpu().numpy(), cmap='binary')
+        plt.clim(0,1)
+
+    plt.savefig(os.path.join(save_path, exp_info + '_' + mode +'.png'))
+
+def save_models(generators, discriminators, exp_info, save_folder, arguments):
+    
+    for n, generator in enumerate(generators):
+        torch.save(generator.state_dict(), os.path.join(save_folder, 'generator' + str(n) + '_'  + exp_info + '.trc'))    
+
+    for n, discriminator in enumerate(discriminators):
+        torch.save(discriminator.state_dict(), os.path.join(save_folder, 'discriminator' + str(n) + '_' + exp_info + '.trc'))    
+
 
 def compile_bssevals(bss_evals): 
     sdrs1, sdrs2 = [], []
@@ -40,7 +96,30 @@ def audio_to_bsseval(s1hats, s2hats, s1s, s2s):
 
     return bss_evals
 
-def mag2spec_and_audio(xhat, MSphase):
+def mag2spec_and_audio_wiener(xhat, recons, MS, MSphase, arguments):
+
+    xhat = xhat.cpu().numpy()
+    recons = recons.cpu().numpy()
+    MS = MS.cpu().numpy()
+    MSphase = MSphase.cpu().numpy()
+    Nmix = MSphase.shape[0]
+   
+    maghats = np.split(xhat, Nmix, axis=0) 
+    reconss = np.split(recons, Nmix, axis=0) 
+    mixmags = np.split(MS, Nmix, axis=0) 
+    phases = np.split(MSphase, Nmix, axis=0)
+
+    all_audio = []
+    eps = 1e-20
+    for maghat, recons, mixmag, phase in zip(maghats, reconss, mixmags, phases):
+        mask = (maghat / (recons + eps))
+        all_audio.append(lr.istft((mask*mixmag*np.exp(1j*phase)).transpose(), 
+                                  win_length=arguments.win_length))
+
+    return all_audio, maghats
+
+
+def mag2spec_and_audio(xhat, MSphase, arguments):
 
     MSphase = MSphase.cpu().numpy()
     Nmix = MSphase.shape[0]
@@ -49,7 +128,8 @@ def mag2spec_and_audio(xhat, MSphase):
 
     all_audio = []
     for mag, phase in zip(mags, phases):
-        all_audio.append(lr.istft((mag*np.exp(1j*phase.squeeze())).transpose()))
+        all_audio.append(lr.istft((mag*np.exp(1j*phase.squeeze())).transpose(), 
+                                  win_length=arguments.win_length))
 
     return all_audio, mags
 
@@ -86,8 +166,9 @@ def form_mixtures(digit1, digit2, loader, arguments):
 
     dataset_mix = dataset1[:Nmix] + dataset2[:Nmix]
         
-    dataset1 = data_utils.TensorDataset(data_tensor=inp1,
-                                        target_tensor=dataset1)
+    dataset1 = TensorDataset(data_tensor=inp1,
+                                        target_tensor=dataset1,
+                                        lens=[1]*Nmix)
     dataset2 = data_utils.TensorDataset(data_tensor=inp2,
                                         target_tensor=dataset2)
     dataset_mix = data_utils.TensorDataset(data_tensor=dataset_mix,
@@ -100,8 +181,9 @@ def form_mixtures(digit1, digit2, loader, arguments):
 
     return loader1, loader2, loader_mix
 
-def get_loaders(data, batch_size, **kwargs):
+def get_loaders(loader_batchsize, **kwargs):
     arguments=kwargs['arguments']
+    data = arguments.data
 
     if data == 'mnist':
         kwargs = {'num_workers': 1, 'pin_memory': True} if arguments.cuda else {}
@@ -111,13 +193,13 @@ def get_loaders(data, batch_size, **kwargs):
                                transforms.ToTensor(),
                                #transforms.Normalize((0,), (1,))
                            ])),
-            batch_size=batch_size, shuffle=True, **kwargs)
+            batch_size=loader_batchsize, shuffle=True, **kwargs)
         test_loader = torch.utils.data.DataLoader(
             datasets.MNIST('../data', train=False, transform=transforms.Compose([
                                transforms.ToTensor(),
                                #transforms.Normalize((7,), (0.3081,))
                            ])),
-            batch_size=batch_size, shuffle=True, **kwargs)
+            batch_size=loader_batchsize, shuffle=True, **kwargs)
 
     return train_loader, test_loader
 
@@ -129,6 +211,96 @@ def sort_pack_tensors(ft, tar, lens):
     tar_packed = rnn_utils.pack_padded_sequence(tar, lens, batch_first=True)
     return ft_packed, tar_packed
 
+def do_pca(X, K):
+    L = X.shape[0]
+
+    X_mean = X.mean(1) 
+    X_zeromean = X - X_mean.reshape(L, 1)
+
+    U, S, V = sp.linalg.svd(X_zeromean) 
+
+    U = U[:, :K] 
+    X_Kdim = np.dot(U.transpose(), X_zeromean) 
+
+def dim_red(X, K, mode):
+    if mode == 'isomap':
+        X_low = skt.manifold.Isomap(5, K).fit_transform(X) 
+    elif mode == 'mds':
+        X_low = skt.manifold.MDS(K).fit_transform(X)
+    elif mode == 'tsne':
+        X_low = skt.manifold.TSNE(K, init='pca', random_state=0).fit_transform(X)
+
+    #plt.plot(X_low[:, 0], X_low[:, 1], 'o')
+    #plt.show()
+    return X_low
+
+def preprocess_timit_files(arguments):
+
+    L, T, step = 150, 200, 50  
+
+    #random.seed( s)
+    #we pick the set according to trial number 
+    Z_temp = tu.sound_set(3) 
+    Z = Z_temp[0:4]
+    mf = Z_temp[4]
+    ff = Z_temp[5]
+
+
+    # Front-end details
+    #if hp is None:
+    sz = 1024       
+    win_length = sz
+
+    #source 1
+    #M1paris, P1 = FE.fe( Z[0] )
+    S1 = lr.stft( Z[0], n_fft=sz, win_length=win_length).transpose()
+    M1, P1 = np.abs(S1), np.angle(S1) 
+    M1, P1, lens1 = [M1], [P1], [M1.shape[0]]
+
+    #dim_red(M1[0], 2, 'tsne') 
+
+    # source 2
+    S2 = lr.stft( Z[1], n_fft=sz, win_length=win_length).transpose()
+    M2, P2 = np.abs(S2), np.angle(S2) 
+    M2, P2, lens2 = [M2], [P2], [M2.shape[0]] 
+
+    #dim_red(M2[0], 2, 'tsne') 
+
+
+    #mixtures
+    M = lr.stft( Z[2]+Z[3], n_fft=sz, win_length=win_length).transpose()
+    M_t, P_t = np.abs(M), np.angle(M) 
+    M_t, P_t, lens_t = [M_t], [P_t], [M_t.shape[0]]
+
+    arguments.n_fft = sz
+    arguments.L2 = M.shape[1]
+    arguments.K = 100
+    arguments.smooth_output = False
+    arguments.dataname = '_'.join([mf, ff])
+    arguments.win_length = win_length
+    arguments.fs = 22050
+
+    T = 200
+    plt.subplot(211)
+    lr.display.specshow(M1[0][:T].transpose(), y_axis='log') 
+    
+    plt.subplot(212)
+    lr.display.specshow(M2[0][:T].transpose(), y_axis='log') 
+
+    fs = 22050
+    lr.output.write_wav('timit_train1.wav', Z[0], fs)
+    lr.output.write_wav('timit_train2.wav', Z[1], fs)
+    lr.output.write_wav('timit_test1.wav', Z[2], fs)
+    lr.output.write_wav('timit_test2.wav', Z[3], fs)
+
+    loader1 = form_torch_audio_dataset(M1, P1, lens1, arguments, 'source') 
+    loader2 = form_torch_audio_dataset(M2, P2, lens2, arguments, 'source')
+    loadermix = form_torch_mixture_dataset(M_t, P_t, 
+                                           M1, M2,  
+                                           [Z[2]], [Z[3]], 
+                                           [Z[2].size], [Z[3].size], 
+                                           arguments)
+    return loader1, loader2, loadermix
 
 
 def preprocess_audio_files(arguments):
@@ -136,8 +308,15 @@ def preprocess_audio_files(arguments):
     and training sequences'''
 
     if arguments.data == 'synthetic_sounds':
+        #dataname = 'generated_sounds_43_71_35_43_64_73'
+        dataname = 'generated_sounds_20_71_43_51_64_73'
+        #dataname = 'generated_sounds_20_71_30_40_64_73'
+        #dataname = 'generated_sounds_20_71_64_73_64_73'
+        #dataname = 'generated_sounds_20_71_50_60_50_60'
         audio_path = os.getcwd().replace('someplaying_around', 
-                                         'generated_sounds_43_71_35_43_64_73') 
+                                         dataname) 
+
+        arguments.dataname = dataname
         arguments.K = 200
 
         files = os.listdir(audio_path)
@@ -158,7 +337,12 @@ def preprocess_audio_files(arguments):
         N1, N2 = len(files_source1), len(files_source2)
         N = min([N1, N2])
         files_source1, files_source2 = files_source1[:N], files_source2[:N]
+    else:
+        raise ValueError('Whaaat?')
 
+    n_fft = 1024
+    win_length = 1024
+    arguments.n_fft, arguments.win_length = n_fft, win_length
     # first load the files and append zeros
     SPCS1abs, SPCS2abs, MSabs = [], [], []
     SPCS1phase, SPCS2phase, MSphase = [], [], [] 
@@ -169,8 +353,8 @@ def preprocess_audio_files(arguments):
         wavfl2, fs = lr.load(os.path.join(audio_path, fl2))
         wavfls1.append(wavfl1), wavfls2.append(wavfl2)
 
-        SPC1 = lr.core.stft(wavfl1, n_fft=1024).transpose()
-        SPC2 = lr.core.stft(wavfl2, n_fft=1024).transpose()
+        SPC1 = lr.core.stft(wavfl1, n_fft=n_fft, win_length=win_length).transpose()
+        SPC2 = lr.core.stft(wavfl2, n_fft=n_fft, win_length=win_length).transpose()
 
         #lens1.append(SPC1.shape[1]), lens2.append(SPC2.shape[1])
         form_np_audio_list(SPC1, SPCS1abs, SPCS1phase)
@@ -183,7 +367,7 @@ def preprocess_audio_files(arguments):
 
     # then compute the spectrograms 
     for i, mixes in enumerate(mixes):
-        M = lr.core.stft(mixes, n_fft=1024).transpose()
+        M = lr.core.stft(mixes, n_fft=n_fft, win_length=win_length).transpose()
         form_np_audio_list(M, MSabs, MSphase) 
 
     if arguments.task == 'spoken_digits':
@@ -196,6 +380,7 @@ def preprocess_audio_files(arguments):
     loader1 = form_torch_audio_dataset(SPCS1abs, SPCS1phase, lens1, arguments, 'source') 
     loader2 = form_torch_audio_dataset(SPCS2abs, SPCS2phase, lens2, arguments, 'source')
     loadermix = form_torch_mixture_dataset(MSabs, MSphase, 
+                                           SPCS1abs, SPCS2abs,  
                                            wavfls1, wavfls2, 
                                            wavlens1, wavlens2, 
                                            arguments)
@@ -235,16 +420,20 @@ def form_torch_audio_dataset(SPCSabs, SPCSphase, lens, arguments, loadertype):
     return loader
 
 def form_torch_mixture_dataset(MSabs, MSphase, 
+                               SPCS1abs, SPCS2abs,
                                wavfls1, wavfls2, 
                                lens1, lens2, 
                                arguments):
 
     MSabs = torch.from_numpy(np.array(MSabs))
     MSphase = torch.from_numpy(np.array(MSphase)) 
+    SPCS1abs = torch.from_numpy(np.array(SPCS1abs)) 
+    SPCS2abs = torch.from_numpy(np.array(SPCS2abs)) 
     wavfls1 = torch.from_numpy(np.array(wavfls1))
     wavfls2 = torch.from_numpy(np.array(wavfls2))
     
-    dataset = MixtureDataset(MSabs, MSphase, wavfls1, wavfls2, lens1, lens2)
+    dataset = MixtureDataset(MSabs, MSphase, SPCS1abs, SPCS2abs, 
+                             wavfls1, wavfls2, lens1, lens2)
 
     kwargs = {'num_workers': 1, 'pin_memory': True} if arguments.cuda else {}
     loader = data_utils.DataLoader(dataset, batch_size=arguments.batch_size, shuffle=False, **kwargs)
@@ -316,12 +505,15 @@ class MixtureDataset(data_utils.Dataset):
         target_tensor (Tensor): contains sample targets (labels).
     """
 
-    def __init__(self, MSabs, MSphase, wavfls1, wavfls2, lens1, lens2):
+    def __init__(self, MSabs, MSphase, SPCS1abs, SPCS2abs, 
+                 wavfls1, wavfls2, lens1, lens2):
         assert MSabs.size(0) == wavfls1.size(0)
         assert wavfls1.size(0) == wavfls2.size(0)
 
         self.MSabs = MSabs
         self.MSphase = MSphase
+        self.SPCS1abs = SPCS1abs
+        self.SPCS2abs = SPCS2abs
         self.wavfls1 = wavfls1
         self.wavfls2 = wavfls2
         self.lens1 = lens1
@@ -329,6 +521,7 @@ class MixtureDataset(data_utils.Dataset):
 
     def __getitem__(self, index):
         return self.MSabs[index], self.MSphase[index], \
+               self.SPCS1abs[index], self.SPCS2abs[index], \
                self.wavfls1[index], self.wavfls2[index], \
                self.lens1[index], self.lens2[index]
 
