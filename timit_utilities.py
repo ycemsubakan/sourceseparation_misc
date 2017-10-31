@@ -3,20 +3,22 @@ import scipy.io.wavfile as wavfile
 import os
 import pdb 
 import librosa as lr
+import itertools as it
 
-eps = finfo( float32).eps;
+eps = finfo(float32).eps;
 
 # Load a TIMIT data set
-def tset( mf = None, ff = None, dr = None):
+def tset(   mf = None, ff = None, dr = None):
     # Where the files are
     #p = '/usr/local/timit/timit-wav/train/'
     home = os.path.expanduser('~')
     p = os.path.join(home, 'Dropbox', 'RNNs', 'timit', 'timit-wav', 'train') 
-
     # Pick a speaker directory
     if dr is None:
         dr = random.randint( 1, 8)
-    p += '/dr%d/' % dr
+        p += '/dr%d/' % dr
+    else:
+        p = os.path.join(p, dr)
 
     # Get two random speakers
     if mf is None:
@@ -25,17 +27,14 @@ def tset( mf = None, ff = None, dr = None):
     if ff is None:
         ff = [name for name in os.listdir( p) if name[0] == 'f']
         ff = random.choice( ff)
-    print ('dr%d/' % dr, mf, ff)
+    #print ('dr%d/' % dr, mf, ff)
 
     # Load all the wav files
-    #ms = [wavfile.read(p+mf+'/'+n)[1] for n in os.listdir( p+mf) if 'wav' in n]
-    #fs = [wavfile.read(p+ff+'/'+n)[1] for n in os.listdir( p+ff) if 'wav' in n]
+    #ms = [wavfile.read(p+'/'+mf+'/'+n)[1] for n in os.listdir( p+'/'+mf) if 'wav' in n]
+    #fs = [wavfile.read(p+'/'+ff+'/'+n)[1] for n in os.listdir( p+'/'+ff) if 'wav' in n]
 
-    ms = [lr.core.load(p+mf+'/'+n)[0] for n in os.listdir( p+mf) if 'wav' in n]
-    fs = [lr.core.load(p+ff+'/'+n)[0] for n in os.listdir( p+ff) if 'wav' in n]
-
-    #fs = [lr.core.load(p+mf+'/'+n)[0] for n in os.listdir( p+mf) if 'wav' in n]
-
+    ms = [lr.core.load(p+'/'+mf+'/'+n, sr=None)[0] for n in os.listdir( p+'/'+mf) if 'wav' in n]
+    fs = [lr.core.load(p+'/'+ff+'/'+n, sr=None)[0] for n in os.listdir( p+'/'+ff) if 'wav' in n]
 
     # Find suitable test file pair
     l1 = list( map( lambda x : x.shape[0], ms))
@@ -55,7 +54,7 @@ def tset( mf = None, ff = None, dr = None):
     return ts, tr, mf, ff
 
 
-def sound_set( tp):
+def sound_set( tp, dr):
     import scipy.io.wavfile as wavfile
 
     # Two sinusoids signal
@@ -94,7 +93,11 @@ def sound_set( tp):
     elif tp == 3:
         # ts,tr = tset( 'fbjl0', 'mwsh0', 5)
         # ts,tr = tset( 'falr0', 'mtqc0', 4)
-        ts,tr,mf,ff = tset()
+        if not dr is None:
+            ts,tr,mf,ff = tset(mf=dr[1], ff=dr[2], dr=dr[0]) 
+        else:
+            ts,tr,mf,ff = tset() 
+
         sr = 16000
 
         tr[0] = tr[0][:min(tr[0].shape[0],tr[1].shape[0])]

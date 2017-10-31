@@ -21,12 +21,60 @@ import itertools as it
 
 def initializationhelper(param, nltype):
     
-    c = 0.4 
+    c = 0.1 
     torchinit.uniform(param.weight, a=-c, b=c)
 
     #torchinit.xavier_uniform(param.weight, gain=c*torchinit.calculate_gain(nltype))
-    c = 0
+    c = 0.1
     torchinit.uniform(param.bias, a=-c, b=c)
+
+
+class VAE(nn.Module):
+    def __init__(self, ngpu, **kwargs):
+        super(VAE, self).__init__()
+
+        self.L1 = kwargs['L1']
+        self.L2 = kwargs['L2']
+        self.K = kwargs['K']
+        self.arguments = kwargs['arguments']
+
+        self.fc1 = nn.Linear(self.L1, self.K)
+        initializationhelper(self.fc1, 'relu')
+
+        self.fc21 = nn.Linear(self.K, self.arguments.Kdisc)
+        initializationhelper(self.fc21, 'relu')
+
+        self.fc22 = nn.Linear(self.K, self.arguments.Kdisc)
+        initializationhelper(self.fc22, 'relu')
+
+        self.fc3 = nn.Linear(self.arguments.Kdisc, self.L2)
+        initializationhelper(self.fc3, 'relu')
+
+
+    def encode(self, x):
+
+        h1 = F.relu(self.fc1(x))
+        return self.fc21(h1), self.fc22(h1)
+
+    def reparameterize(self, mu, logvar):
+        if self.training:
+          std = logvar.mul(0.5).exp_()
+          eps = Variable(std.data.new(std.size()).normal_())
+          return eps.mul(std).add_(mu)
+        else:
+          return mu
+
+    def decode(self, z):
+        return F.softplus(self.fc3(z))
+
+    def forward(self, inp):
+        
+        if not (type(inp) == Variable):
+            inp = Variable(inp[0])
+
+        mu, logvar = self.encode(inp)
+        z = self.reparameterize(mu, logvar)
+        return self.decode(z), mu, logvar
 
 class netG(nn.Module):
     def __init__(self, ngpu, **kwargs):
@@ -39,7 +87,6 @@ class netG(nn.Module):
         self.arguments = kwargs['arguments']
         self.l1 = nn.Linear(self.L1, self.K+pl, bias=True)
         initializationhelper(self.l1, 'relu')
-        self.l1_bn = nn.BatchNorm1d(self.K+pl)
 
         self.l2 = nn.Linear(self.K+pl, self.L2, bias=True) 
         initializationhelper(self.l2, 'relu')
@@ -56,7 +103,7 @@ class netG(nn.Module):
         if not (type(inp) == Variable):
             inp = Variable(inp[0])
 
-        if self.arguments.tr_method == 'adversarial':
+        if self.arguments.tr_method in ['adversarial', 'adversarial_wasserstein']:
             h = F.softplus((self.l1(inp)))
         elif self.arguments.tr_method == 'ML':
             h = F.softplus((self.l1(inp)))
@@ -70,12 +117,53 @@ class netG(nn.Module):
             output = output.view(-1, self.L2)
         return output
 
+class netG_onelayer(nn.Module):
+    def __init__(self, ngpu, **kwargs):
+        super(netG_onelayer, self).__init__()
+        self.ngpu = ngpu
+        pl = 0
+        self.L1 = kwargs['L1']
+        self.L2 = kwargs['L2']
+        self.arguments = kwargs['arguments']
+        self.l1 = nn.Linear(self.L1, self.L2, bias=True)
+        initializationhelper(self.l1, 'relu')
+
+
+    def forward(self, inp):
+        if not (type(inp) == Variable):
+            inp = Variable(inp[0])
+
+        output = F.softplus((self.l1(inp)))
+     
+        return output
+
+class netG_onelayer_sp(nn.Module):
+    def __init__(self, ngpu, **kwargs):
+        super(netG_onelayer_sp, self).__init__()
+        self.ngpu = ngpu
+        pl = 0
+        self.L1 = kwargs['L1']
+        self.L2 = kwargs['L2']
+        self.arguments = kwargs['arguments']
+
+        c = 0.1
+        self.l1 = torch.nn.Parameter((c*torch.randn(self.L1, self.L2)))
+        #self.b1 = torch.nn.Parameter((c*torch.randn(1,self.L2)))
+
+    def forward(self, inp):
+        if not (type(inp) == Variable):
+            inp = Variable(inp[0])
+
+        output = torch.mm(inp, F.softplus(self.l1))
+        #output = output + self.b1
+        return output
+
 class netD(nn.Module):
     def __init__(self, ngpu, **kwargs):
         super(netD, self).__init__()
         self.ngpu = ngpu
         self.L = kwargs['L']
-        self.K = kwargs['K'] + 100
+        self.K = kwargs['K'] 
         self.arguments = kwargs['arguments']
 
         self.l1 = nn.Linear(self.L, self.K, bias=True)
@@ -101,7 +189,11 @@ class netD(nn.Module):
         
         #h2 = F.tanh(self.l2_bn(self.l2(h1)))
 
-        output = F.sigmoid(self.l3(h1))
+        if self.arguments.tr_method == 'adversarial_wasserstein':
+            output = (self.l3(h1))
+        else:
+            output = F.sigmoid(self.l3(h1))
+
         return output, h1
 
 class netG_images(nn.Module):
@@ -174,6 +266,167 @@ class netD_images(nn.Module):
         output = F.sigmoid(self.l3(h2))
         return output, h1
 
+def adversarial_wasserstein_trainer(loader_mix, train_loader, 
+                                    generator, discriminator, EP=5,
+                                    **kwargs):
+    arguments = kwargs['arguments']
+    conditional_gen = kwargs['conditional_gen']
+    source_num = kwargs['source_num']
+    
+    def drawgendata_2d():
+
+        mode = 'isomap'
+        
+        all_data = torch.cat([tar[0], out_g.data], 0) 
+        all_data_numpy = all_data.cpu().numpy()
+        N = all_data.size()[0]
+
+        disc_values, _ = discriminator.forward(Variable(all_data)) 
+        disc_values = disc_values.data.cpu().numpy()
+        disc_vals_real = disc_values[:N/2]
+        disc_vals_fake = disc_values[(N/2):]
+
+        lowdim_out = ut.dim_red(all_data_numpy, 2, mode)
+        #lowdim_data = ut.dim_red(tar.data.numpy(), 2, mode)
+
+        plt.subplot2grid((2,2),(0,0)) 
+        ss = 1
+        
+        sc = plt.scatter(lowdim_out[:(N/2):ss, 0], lowdim_out[:(N/2):ss, 1], c=disc_vals_real[::ss], marker='o')
+        sc = plt.scatter(lowdim_out[N/2::ss, 0], lowdim_out[N/2::ss, 1], c=disc_vals_fake[::ss], marker='x')
+    
+        plt.colorbar(sc)
+        plt.title('Scatter plot of real vs generated data')
+        
+        plt.subplot2grid((2, 2), (0, 1))
+        plt.hist2d(lowdim_out[:N/2, 0], lowdim_out[:N/2:,1], bins=100,
+                   norm=colors.LogNorm())
+        plt.colorbar()
+        plt.plot(lowdim_out[N/2:, 0], lowdim_out[N/2:, 1], 'rx', label='generated data')
+        plt.title('Histogram of training data vs generated data')
+        plt.legend()
+        
+        plt.subplot2grid((2,2), (1, 0), colspan=2)
+        genspec = out_g.data.cpu().numpy().transpose()[:, :200]
+        lrd.specshow(genspec, y_axis='log', x_axis='time') 
+
+        plt.suptitle('Situation at iteration {}'.format(ep))
+        #plt.scatter(lowdim_out[::10, 0], lowdim_out[::10, 1], c=disc_values[::10]) 
+
+        folder_name = 'figures_' + arguments.exp_info
+        if not os.path.exists(folder_name):
+            os.mkdir(folder_name) 
+
+        if 1:
+            plt.savefig(os.path.join(folder_name, 'source_{}, iter_{}'.format(source_num,
+                                                                              ep))) 
+    
+    if arguments.optimizer == 'Adam':
+        optimizerD = optim.Adam(discriminator.parameters(), lr=arguments.lr, betas=(0.9, 0.999))
+        optimizerG = optim.Adam(generator.parameters(), lr=arguments.lr, betas=(0.9, 0.999))
+    elif arguments.optimizer == 'RMSprop':
+        optimizerD = optim.RMSprop(discriminator.parameters(), lr=arguments.lr)
+        optimizerG = optim.RMSprop(generator.parameters(), lr=arguments.lr)
+    else:
+        raise ValueError('Whaaaat?')
+
+    if not arguments.cuda and arguments.plot_training:
+        my_dpi = 96
+        plt.figure(figsize=(1200/my_dpi, 600/my_dpi), dpi=my_dpi)
+
+    one = torch.FloatTensor([1])
+    mone = one * -1
+
+    for ep in range(EP):
+        for (ft, tar, lens), mix in zip(train_loader, loader_mix):
+            if arguments.cuda:
+                ft = ft.cuda()
+                tar = tar.cuda()
+                lens = lens.cuda()
+                one, mone = one.cuda(), mone.cuda()
+                #mix = mix.cuda()
+
+            
+            for p in discriminator.parameters(): # reset requires_grad
+                p.requires_grad = True # they are set to False below in netG update
+
+
+            if ep < 25 or ep % 500 == 0:
+                Diters = 100
+            else:
+                Diters = 5
+
+
+            # sort the tensors within batch
+            if arguments.task == 'images' or arguments.task == 'toy_data':
+                tar = tar.contiguous().view(-1, arguments.L2)
+                tar, ft = Variable(tar), Variable(ft)
+            else:
+                ft, tar = ut.sort_pack_tensors(ft, tar, lens)
+
+            for disc_ep in range(Diters):
+                
+                for p in discriminator.parameters():
+                    p.data.clamp_(arguments.clamp_lower, 
+                                  arguments.clamp_upper)
+
+                # discriminator gradient with real data
+                discriminator.zero_grad()
+                out_d, _ = discriminator.forward(tar)
+                err_D_real = out_d.mean()
+                err_D_real.backward(one)
+
+                # discriminator gradient with generated data
+                out_g = generator.forward(Variable(ft[0], volatile=True))
+                out_d_g, _ = discriminator.forward(Variable(out_g.data))
+                err_D_fake = out_d_g.mean()
+                err_D_fake.backward(mone)
+
+                err_D = err_D_real - err_D_fake
+                optimizerD.step()
+
+
+            # show the current generated output
+            if not arguments.cuda and arguments.plot_training:
+                if arguments.task == 'atomic_sourcesep':
+                    if ep % 100 == 0:
+                        drawnow(drawgendata_atomic)
+                        drawnow(drawgendata_2d) 
+                elif arguments.task == 'images':
+                    drawnow(drawgendata)
+                elif arguments.task == 'toy_data':
+                    drawnow(drawgendata_toy)
+                else:
+                    raise ValueError('Whhhhhaaaaat')
+            else:
+                if arguments.plot_training:
+                    if arguments.task == 'atomic_sourcesep':
+                        if ep % 100 == 0:
+                            my_dpi = 96
+                            fig = plt.figure(figsize=(1200/my_dpi, 600/my_dpi), dpi=my_dpi)
+                            drawgendata_2d()
+                            plt.close(fig)
+
+            generator_params = list(generator.parameters())
+            print(generator_params[0].data.sum())
+
+            for p in discriminator.parameters():
+                p.requires_grad = False # to avoid computation
+
+            # generator gradient
+            generator.zero_grad()
+            out_g = generator.forward(Variable(ft[0]))
+            out_d_g, _ = discriminator.forward(out_g)
+            err_G = out_d_g.mean()
+            err_G.backward(one)
+
+            optimizerG.step()
+           
+            if arguments.verbose:
+                print('[%d/%d] Loss_D: %f Loss_G: %f Loss_D_real: %f Loss_D_fake %f\r'%
+                      (ep, EP, err_D.data[0], err_G.data[0], err_D_real.data[0], 
+                      err_D_fake.data[0]))
+                  
 
 def adversarial_trainer(loader_mix, train_loader, 
                         generator, discriminator, EP=5,
@@ -181,9 +434,10 @@ def adversarial_trainer(loader_mix, train_loader,
     arguments = kwargs['arguments']
     criterion = kwargs['criterion']
     conditional_gen = kwargs['conditional_gen']
+    source_num = kwargs['source_num']
  
     L1, L2 = generator.L1, generator.L2
-    K = generator.K
+    #K = generator.K
     def drawgendata():
         I = 1
         N = 3 if arguments.task == 'mnist' else 2
@@ -231,7 +485,7 @@ def adversarial_trainer(loader_mix, train_loader,
         lowdim_out = ut.dim_red(all_data_numpy, 2, mode)
         #lowdim_data = ut.dim_red(tar.data.numpy(), 2, mode)
 
-        plt.subplot(121) 
+        plt.subplot2grid((2,2),(0,0)) 
         ss = 1
         
         sc = plt.scatter(lowdim_out[:(N/2):ss, 0], lowdim_out[:(N/2):ss, 1], c=disc_vals_real[::ss], marker='o', vmin=0, vmax=1)
@@ -240,7 +494,7 @@ def adversarial_trainer(loader_mix, train_loader,
         plt.colorbar(sc)
         plt.title('Scatter plot of real vs generated data')
         
-        plt.subplot(122)
+        plt.subplot2grid((2, 2), (0, 1))
         plt.hist2d(lowdim_out[:N/2, 0], lowdim_out[:N/2:,1], bins=100,
                    norm=colors.LogNorm())
         plt.colorbar()
@@ -248,6 +502,10 @@ def adversarial_trainer(loader_mix, train_loader,
         plt.title('Histogram of training data vs generated data')
         plt.legend()
         
+        plt.subplot2grid((2,2), (1, 0), colspan=2)
+        genspec = out_g.data.cpu().numpy().transpose()[:, :200]
+        lrd.specshow(genspec, y_axis='log', x_axis='time') 
+
         plt.suptitle('Situation at iteration {}'.format(ep))
         #plt.scatter(lowdim_out[::10, 0], lowdim_out[::10, 1], c=disc_values[::10]) 
 
@@ -256,7 +514,8 @@ def adversarial_trainer(loader_mix, train_loader,
             os.mkdir(folder_name) 
 
         if 1:
-            plt.savefig(os.path.join(folder_name, 'iter_{}'.format(ep))) 
+            plt.savefig(os.path.join(folder_name, 'iter_{}, source_{}'.format(ep, 
+                                                                              source_num))) 
 
     def drawgendata_toy():
         samples = out_g.data.numpy()
@@ -305,7 +564,7 @@ def adversarial_trainer(loader_mix, train_loader,
     else:
         raise ValueError('Whaaaat?')
 
-    if not arguments.cuda:
+    if not arguments.cuda and arguments.plot_training:
         my_dpi = 96
         plt.figure(figsize=(1200/my_dpi, 600/my_dpi), dpi=my_dpi)
     true, false = 1, 0
@@ -324,32 +583,37 @@ def adversarial_trainer(loader_mix, train_loader,
             else:
                 ft, tar = ut.sort_pack_tensors(ft, tar, lens)
 
-            # discriminator gradient with real data
-            discriminator.zero_grad()
-            out_d, _ = discriminator.forward(tar)
-            print(out_d.sum())
-            labels = Variable(torch.ones(out_d.size(0))*true).squeeze().float()
-            if arguments.cuda:
-                labels = labels.cuda()
-            err_D_real = criterion(out_d, labels)
-            err_D_real.backward()
+            if ep < 25 or ep % 500 == 0:
+                Diters = 100
+            else:
+                Diters = 5
 
-            # discriminator gradient with generated data
-            #if conditional_gen: 
-            #    inp = mix.contiguous().view(-1, L1)
-            #else:
-            #    inp = ft_rshape # fixed_noise.contiguous().view(-1, L)
+            for disc_ep in range(Diters):
+                # discriminator gradient with real data
+                discriminator.zero_grad()
+                out_d, _ = discriminator.forward(tar)
+                labels = Variable(torch.ones(out_d.size(0))*true).squeeze().float()
+                if arguments.cuda:
+                    labels = labels.cuda()
+                err_D_real = criterion(out_d, labels)
+                err_D_real.backward()
 
-            out_g = generator.forward(ft)
-            out_d_g, _ = discriminator.forward(out_g)
-            labels = Variable(torch.ones(out_d.size(0))*false).squeeze().float()
-            if arguments.cuda:
-                labels = labels.cuda()
-            err_D_fake = criterion(out_d_g, labels) 
-            err_D_fake.backward(retain_variables=True)
+                # discriminator gradient with generated data
+                #if conditional_gen: 
+                #    inp = mix.contiguous().view(-1, L1)
+                #else:
+                #    inp = ft_rshape # fixed_noise.contiguous().view(-1, L)
 
-            err_D = err_D_real + err_D_fake
-            optimizerD.step()
+                out_g = generator.forward(ft)
+                out_d_g, _ = discriminator.forward(out_g.detach())
+                labels = Variable(torch.ones(out_d.size(0))*false).squeeze().float()
+                if arguments.cuda:
+                    labels = labels.cuda()
+                err_D_fake = criterion(out_d_g, labels) 
+                err_D_fake.backward()
+
+                err_D = err_D_real + err_D_fake
+                optimizerD.step()
 
 
             # show the current generated output
@@ -373,28 +637,39 @@ def adversarial_trainer(loader_mix, train_loader,
                             drawgendata_2d()
                             plt.close(fig)
 
+            cnt = 1
+            for gent_ep in range(1):
+                #generator_params = list(generator.parameters())
+                #print(generator_params[0].data.sum())
 
+                # generator gradient
+                generator.zero_grad()
+                if arguments.feat_match:
+                    _, out_h_data = discriminator.forward(tar)    
+                    _, out_h_g = discriminator.forward(out_g) 
+                    err_G = ((out_h_data.mean(0) - out_h_g.mean(0))**2).sum()
+                else:
+                    out_d_g, _ = discriminator.forward(out_g)
+                    labels = Variable(torch.ones(out_d.size(0))*true).squeeze().float()
+                    if arguments.cuda:
+                        labels = labels.cuda()
+                    err_G = criterion(out_d_g, labels)
+                err_G.backward(retain_variables=True)
 
-            # generator gradient
-            generator.zero_grad()
-            if arguments.feat_match:
-                _, out_h_data = discriminator.forward(tar)    
-                _, out_h_g = discriminator.forward(out_g) 
-                err_G = ((out_h_data.mean(0) - out_h_g.mean(0))**2).sum()
-            else:
-                out_d_g, _ = discriminator.forward(out_g)
-                labels = Variable(torch.ones(out_d.size(0))*true).squeeze().float()
-                if arguments.cuda:
-                    labels = labels.cuda()
-                err_G = criterion(out_d_g, labels)
-            err_G.backward()
+                #if out_d_g.mean().data.cpu().numpy() > 0.3:
+                #    break
 
-            optimizerG.step()
+                #print(generator_params[0].data.sum())
 
-            print(out_d.mean())
-            print(out_d_g.mean())
-            print(err_G.mean())
-            print(ep)
+                optimizerG.step()
+                #generator_params2 = list(generator.parameters())
+                #diff = (generator_params[0] - generator_params2[0]).sum().data.cpu().numpy()
+                #print('Diff is {}'.format(diff))
+
+                print(out_d.mean())
+                print(out_d_g.mean())
+                print(err_G.mean())
+                print(ep)
 
 def generative_trainer(loader_mix, train_loader, 
                         generator, EP = 5,
@@ -454,7 +729,7 @@ def generative_trainer(loader_mix, train_loader,
     elif arguments.optimizer == 'RMSprop':
         optimizerG = optim.RMSprop(generator.parameters(), lr=arguments.lr)
 
-    if not arguments.cuda:
+    if not arguments.cuda and arguments.plot_training:
         figure(figsize=(4,4))
     true, false = 1, 0
     for ep in range(EP):
@@ -495,6 +770,146 @@ def generative_trainer(loader_mix, train_loader,
             print(err_G)
             print(ep)
 
+
+
+def VAE_trainer(loader_mix, train_loader, 
+                generator, EP = 5,
+                **kwargs):
+    arguments = kwargs['arguments']
+    criterion = kwargs['criterion']
+    conditional_gen = kwargs['conditional_gen']
+
+    generator.train()
+
+    L1 = generator.L1
+    L2 = generator.L2
+    K = generator.K
+
+    if arguments.optimizer == 'Adam':
+        optimizerG = optim.Adam(generator.parameters(), lr=arguments.lr, betas=(0.9, 0.999))
+    elif arguments.optimizer == 'RMSprop':
+        optimizerG = optim.RMSprop(generator.parameters(), lr=arguments.lr)
+
+    if not arguments.cuda and arguments.plot_training:
+        figure(figsize=(4,4))
+    true, false = 1, 0
+    for ep in range(EP):
+        for (ft, tar, lens), mix in zip(train_loader, loader_mix):
+            if arguments.cuda:
+                tar = tar.cuda()
+                ft = ft.cuda()
+                lens = lens.cuda()
+
+            # sort the tensors within batch
+            if arguments.task == 'images':
+                tar = tar.contiguous().view(-1, arguments.L2)
+                tar, ft = Variable(tar), Variable(ft)
+            else:
+                ft, tar = ut.sort_pack_tensors(ft, tar, lens)
+                tar = Variable(tar[0])
+
+            #if conditional_gen: 
+            #    inp = mix.contiguous().view(-1, L)
+            #else:
+            #    inp = ft_rshape   # fixed_noise.contiguous().view(-1, L)
+
+            # generator gradient
+            generator.zero_grad()
+            out_g, mu, logvar = generator.forward(ft)
+            err_G = criterion(out_g, tar, mu, logvar)
+            err_G.backward()
+
+            # step 
+            optimizerG.step()
+
+            print(err_G)
+            print(ep)
+
+
+
+def reconstruct_tester(generators, source_num, 
+                       loader_mix, EP, **kwargs):
+    generator1, generator2 = generators
+    
+
+    arguments = kwargs['arguments']
+    optimizer = arguments.optimizer
+    loss = kwargs['loss']
+    exp_info = kwargs['exp_info']
+    L1 = generator1.L1
+    L2 = generator1.L2
+
+    for i, (MSabs, MSphase, SPCS1abs, SPCS2abs, wavfls1, wavfls2, lens1, lens2) in enumerate(islice(loader_mix, 0, 1, 1)): 
+
+        source_tar = SPCS1abs if source_num == 1 else SPCS2abs
+
+        eps = 1e-20
+        if arguments.cuda:
+            source_tar = source_tar.cuda()
+
+        print('Processing source ',i)
+        Nmix = source_tar.size(0)
+        T = source_tar.size(1)
+        source_tar = source_tar.contiguous().view(-1, L2) 
+
+        if arguments.test_method == 'optimize':
+            c = 1
+            if arguments.cuda:
+                x = Variable(c*torch.randn(Nmix*T, L1).cuda(), requires_grad=True)
+            else:
+                x = Variable(c*torch.randn(Nmix*T, L1), requires_grad=True)
+
+            if optimizer == 'Adam':
+                optimizer_sourcesep = optim.Adam([x], lr=1e-3, betas=(0.5, 0.999))
+            elif optimizer == 'RMSprop':
+                optimizer_sourcesep = optim.RMSprop([x], lr=1e-3)
+            else:
+                raise ValueError('Whaaaaaaaat')
+
+            for ep in range(EP):
+
+                source_hat = generator1.forward(x) if source_num == 1 else generator2.forward(x)
+
+                if loss == 'Euclidean': 
+                    err = torch.mean((Variable(source_tar) - source_hat)**2)
+                elif loss == 'Poisson':
+                    err = torch.mean(-Variable(source_tar)*torch.log(source_hat+eps) + source_hat)
+
+                if arguments.smooth_source_estimates:
+                    serr = 0*torch.mean(torch.abs(source_hat[1:] - source_hat[:-1]))
+                    err = err + serr
+                err.backward()
+
+                optimizer_sourcesep.step()
+
+                x.grad.data.zero_()
+
+                print('Step in batch [{:d}\{:d}]'.format(ep+1, EP))
+                print('The error is ', err)
+                if arguments.smooth_source_estimates:
+                    print('The smoothness error is ', serr)
+
+
+            # get the final source estimate
+            source_hat = generator1.forward(x) if source_num == 1 else generator2.forward(x)
+            curdir = os.getcwd() 
+            reconspath = os.path.join(curdir, 'reconstructions')
+            
+            if not os.path.exists(reconspath):
+                os.mkdir(reconspath)
+
+            fn = np.sqrt
+            plt.subplot(211)
+            lrd.specshow(fn(source_tar.cpu().numpy()).transpose(), y_axis='log', x_axis='time')
+            plt.title('Original source')
+
+            plt.subplot(212)
+            lrd.specshow(fn(source_hat.data.cpu().numpy()).transpose(), y_axis='log', x_axis='time')
+            plt.title('Reconstructed source')
+            plt.savefig(os.path.join(reconspath, 
+                        '_'.join([exp_info, 
+                            'reconstruction_{}'.format(source_num)])+'.png'))
+     
 
 def maxlikelihood_separatesources(generators, loader_mix, EP, **kwargs):
     generator1, generator2 = generators
@@ -583,6 +998,9 @@ def ML_separate_audio_sources(generators, loader_mix, EP, **kwargs):
     exp_info = kwargs['exp_info']
     L1 = generator1.L1
     L2 = generator1.L2
+    if arguments.tr_method == 'VAE':
+        generator1.eval()
+        generator2.eval()
 
     s1s, s2s = [], [] 
     s1hats, s2hats = [], []
@@ -602,14 +1020,13 @@ def ML_separate_audio_sources(generators, loader_mix, EP, **kwargs):
         MSabs = MSabs.contiguous().view(-1, L2) 
 
         if arguments.test_method == 'optimize':
-            x1, x2 = torch.rand(Nmix*T, L1), torch.rand(Nmix*T, L1)
-
+            c = 1
             if arguments.cuda:
-                x1 = Variable(torch.randn(Nmix*T, L1).cuda(), requires_grad=True)
-                x2 = Variable(torch.randn(Nmix*T, L1).cuda(), requires_grad=True)
+                x1 = Variable(c*torch.randn(Nmix*T, L1).cuda(), requires_grad=True)
+                x2 = Variable(c*torch.randn(Nmix*T, L1).cuda(), requires_grad=True)
             else:
-                x1 = Variable(torch.randn(Nmix*T, L1), requires_grad=True)
-                x2 = Variable(torch.randn(Nmix*T, L1), requires_grad=True)
+                x1 = Variable(c*torch.randn(Nmix*T, L1), requires_grad=True)
+                x2 = Variable(c*torch.randn(Nmix*T, L1), requires_grad=True)
 
             if optimizer == 'Adam':
                 optimizer_sourcesep = optim.Adam([x1, x2], lr=1e-3, betas=(0.5, 0.999))
@@ -619,15 +1036,25 @@ def ML_separate_audio_sources(generators, loader_mix, EP, **kwargs):
                 raise ValueError('Whaaaaaaaat')
 
             for ep in range(EP):
-                source1hat, source2hat = generator1.forward(x1), generator2.forward(x2)  
+                if arguments.tr_method == 'VAE':
+                    source1hat, _, _ = generator1.forward(x1) 
+                    source2hat, _, _ = generator2.forward(x2)  
+                else:
+                    source1hat = generator1.forward(x1)
+                    source2hat = generator2.forward(x2)
+
                 mix_sum = source1hat + source2hat
                 if loss == 'Euclidean': 
                     err = torch.mean((Variable(MSabs) - mix_sum)**2)
                 elif loss == 'Poisson':
                     err = torch.mean(-Variable(MSabs)*torch.log(mix_sum+eps) + mix_sum)
 
+                if arguments.smooth_source_estimates:
+                    serr = 0.1*torch.mean(torch.abs(source1hat[1:] - source1hat[:-1]) \
+                              +torch.abs(source2hat[1:] - source2hat[:-1]))
+                    err = err + serr
                 # if adversarial use discriminator information
-                if arguments.tr_method == 'adversarial':
+                if arguments.tr_method in ['adversarial', 'adversarial_wasserstein']:
                     if arguments.feat_match: 
                         _, source1hat_feat = discriminator1.forward(source1hat)
                         _, source2hat_feat = discriminator2.forward(source2hat)
@@ -645,8 +1072,10 @@ def ML_separate_audio_sources(generators, loader_mix, EP, **kwargs):
                     else:
                         source1hat_cl, _ = discriminator1.forward(source1hat)
                         source2hat_cl, _ = discriminator2.forward(source2hat)
-                        source1hat_cl = torch.log(source1hat_cl + eps)
-                        source2hat_cl = torch.log(source2hat_cl + eps)
+
+                        if arguments.tr_method == 'adversarial': 
+                            source1hat_cl = torch.log(source1hat_cl + eps)
+                            source2hat_cl = torch.log(source2hat_cl + eps)
 
                     err = err - alpha*(source1hat_cl.mean() + source2hat_cl.mean()) 
                 err.backward()
@@ -658,9 +1087,18 @@ def ML_separate_audio_sources(generators, loader_mix, EP, **kwargs):
 
                 print('Step in batch [{:d}\{:d}]'.format(ep+1, EP))
                 print('The error is ', err)
+                if arguments.smooth_source_estimates:
+                    print('The smoothness error is ', serr)
 
-            temp1 = generator1.forward(x1).data.cpu().numpy() 
-            temp2 = generator2.forward(x2).data.cpu().numpy() 
+            if arguments.tr_method == 'VAE':
+                temp1, _, _ = generator1.forward(x1)
+                temp1 = temp1.data.cpu().numpy() 
+
+                temp2, _, _ = generator2.forward(x2)
+                temp2 = temp2.data.cpu().numpy() 
+            else:
+                temp1 = generator1.forward(x1).data.cpu().numpy() 
+                temp2 = generator2.forward(x2).data.cpu().numpy() 
 
         elif arguments.test_method == 'sample':
             pf_nsamples = 5 
@@ -690,12 +1128,25 @@ def ML_separate_audio_sources(generators, loader_mix, EP, **kwargs):
             temp2 = torch.cat(x2s, 0).cpu().numpy()
         else:
             raise ValueError('Whaaaaat')
-        
-        temp1_audio, mags1 = ut.mag2spec_and_audio(temp1, MSphase, arguments)
+       
+        if arguments.wiener_recons:
+            temp1_audio, mags1 = ut.mag2spec_and_audio_wiener(temp1, 
+                                                              temp1+temp2,
+                                                              MSabs,
+                                                              MSphase, arguments)
+        else: 
+            temp1_audio, mags1 = ut.mag2spec_and_audio(temp1, MSphase, arguments)
+
         all_mags1.extend(mags1)
         s1hats.extend(temp1_audio)
 
-        temp2_audio, mags2 = ut.mag2spec_and_audio(temp2, MSphase, arguments)
+        if arguments.wiener_recons:
+            temp2_audio, mags2 = ut.mag2spec_and_audio_wiener(temp2, 
+                                                              temp1+temp2,
+                                                              MSabs,
+                                                              MSphase, arguments)
+        else:
+            temp2_audio, mags2 = ut.mag2spec_and_audio(temp2, MSphase, arguments)
         all_mags2.extend(mags2)
         s2hats.extend(temp2_audio)
 
@@ -716,31 +1167,35 @@ def ML_separate_audio_sources(generators, loader_mix, EP, **kwargs):
 
         mag1, mag2 = mag1.transpose(), mag2.transpose()
         s1, s2 = s1.squeeze(), s2.squeeze()
+        fn = np.sqrt
 
         if arguments.save_files:
 
             plt.subplot(3, 2, 1)
-            lrd.specshow(np.abs(lr.stft(s1+s2, n_fft=1024)), y_axis='log', x_axis='time')
+            lrd.specshow(fn(np.abs(lr.stft(s1+s2, n_fft=1024))), y_axis='log', x_axis='time')
             plt.title('Observed Mixture')
 
             plt.subplot(3, 2, 3)
-            lrd.specshow(np.abs(lr.stft(s1, n_fft=1024)), y_axis='log', x_axis='time')
+            lrd.specshow(fn(np.abs(lr.stft(s1, n_fft=1024))), 
+                         y_axis='log', x_axis='time')
             plt.title('Source 1')
 
             plt.subplot(3, 2, 5) 
-            lrd.specshow(np.abs(lr.stft(s2, n_fft=1024)), y_axis='log', x_axis='time')
+            lrd.specshow(fn(np.abs(lr.stft(s2, n_fft=1024))),
+                         y_axis='log', x_axis='time')
             plt.title('Source 2')
 
             plt.subplot(3, 2, 2)
-            lrd.specshow(mag1+mag2, y_axis='log', x_axis='time')
+            lrd.specshow(fn(mag1+mag2),
+                         y_axis='log', x_axis='time')
             plt.title('Reconstruction')
 
             plt.subplot(3, 2, 4)
-            lrd.specshow(mag1, y_axis='log', x_axis='time')
+            lrd.specshow(fn(mag1), y_axis='log', x_axis='time')
             plt.title('Sourcehat 1')
 
             plt.subplot(3, 2, 6) 
-            lrd.specshow(mag2,  y_axis='log', x_axis='time')
+            lrd.specshow(fn(mag2),  y_axis='log', x_axis='time')
             plt.title('Sourcehat 2')
         
             figname = 'spectrograms_{}'.format(i)

@@ -13,6 +13,29 @@ import matplotlib.pyplot as plt
 import timit_utilities as tu
 import scipy as sp
 import sklearn as skt
+import itertools as it
+
+def append_dirs(directories):
+    all_dirs = [ ''.join(dr) for dr in directories]
+    all_dirs_str = '_' + ''.join(all_dirs) + '_'
+    return all_dirs_str 
+
+def list_timit_dirs():
+    home = os.path.expanduser('~')
+    p = os.path.join(home, 'Dropbox', 'RNNs', 'timit', 'timit-wav', 'train') 
+
+    directories = os.listdir(p)
+    possible_dirs = []
+    for dr in directories:
+        path = os.path.join(p, dr)
+
+        males = [name for name in os.listdir(path) if name[0] == 'm']
+        females = [name for name in os.listdir(path) if name[0] == 'f']
+
+        possible_dirs = it.chain(possible_dirs, it.product([dr], males, females))
+
+    return possible_dirs
+        
 
 def prepare_mixture_gm_data(arguments):
     dataset = []
@@ -81,6 +104,7 @@ def compile_bssevals(bss_evals):
 
 def audio_to_bsseval(s1hats, s2hats, s1s, s2s):
     bss_evals = []
+    bss_evals_paris = []
     for i, (s1hat, s2hat, s1, s2) in enumerate(zip(s1hats, s2hats, s1s, s2s)):
 
         print('Computing bssevals for mixture {}'.format(i))
@@ -93,22 +117,37 @@ def audio_to_bsseval(s1hats, s2hats, s1s, s2s):
 
         bss_evals.append(mevalsep.bss_eval_sources(source_mat[:, :Nmin], 
                                                    sourcehat_mat[:, :Nmin]))
+        bss_evals_paris.append([tu.bss_eval(sourcehat_mat[0, :Nmin], 0, 
+                                            source_mat[:, :Nmin]), 
+                                tu.bss_eval(sourcehat_mat[1, :Nmin], 1,
+                                            source_mat[:, :Nmin])])
+        print(bss_evals)
+        print(bss_evals_paris) 
+
 
     return bss_evals
 
 def mag2spec_and_audio_wiener(xhat, recons, MS, MSphase, arguments):
 
-    xhat = xhat.cpu().numpy()
-    recons = recons.cpu().numpy()
-    MS = MS.cpu().numpy()
-    MSphase = MSphase.cpu().numpy()
-    Nmix = MSphase.shape[0]
-   
-    maghats = np.split(xhat, Nmix, axis=0) 
-    reconss = np.split(recons, Nmix, axis=0) 
-    mixmags = np.split(MS, Nmix, axis=0) 
-    phases = np.split(MSphase, Nmix, axis=0)
+    #xhat = xhat.cpu().numpy()
+    #recons = recons.cpu().numpy()
+    try:   # pytorch case
+        MS = MS.cpu().numpy()
+        MSphase = MSphase.cpu().numpy()
+        Nmix = MSphase.shape[0]
 
+        maghats = np.split(xhat, Nmix, axis=0) 
+        reconss = np.split(recons, Nmix, axis=0) 
+        mixmags = np.split(MS, Nmix, axis=0) 
+        phases = np.split(MSphase, Nmix, axis=0)
+
+    except:
+        maghats = [xhat]
+        reconss = [recons]
+        mixmags = [MS]
+        phases = [MSphase]
+
+   
     all_audio = []
     eps = 1e-20
     for maghat, recons, mixmag, phase in zip(maghats, reconss, mixmags, phases):
@@ -234,13 +273,13 @@ def dim_red(X, K, mode):
     #plt.show()
     return X_low
 
-def preprocess_timit_files(arguments):
+def preprocess_timit_files(arguments, dr=None):
 
     L, T, step = 150, 200, 50  
 
     #random.seed( s)
     #we pick the set according to trial number 
-    Z_temp = tu.sound_set(3) 
+    Z_temp = tu.sound_set(3, dr = dr) 
     Z = Z_temp[0:4]
     mf = Z_temp[4]
     ff = Z_temp[5]
@@ -272,31 +311,36 @@ def preprocess_timit_files(arguments):
     M_t, P_t = np.abs(M), np.angle(M) 
     M_t, P_t, lens_t = [M_t], [P_t], [M_t.shape[0]]
 
+    M_t1 = [np.abs(lr.stft( Z[2], n_fft=sz, win_length=win_length).transpose())]
+    M_t2 = [np.abs(lr.stft( Z[3], n_fft=sz, win_length=win_length).transpose())]
+
     arguments.n_fft = sz
     arguments.L2 = M.shape[1]
-    arguments.K = 100
+    #arguments.K = 100
     arguments.smooth_output = False
     arguments.dataname = '_'.join([mf, ff])
     arguments.win_length = win_length
-    arguments.fs = 22050
+    arguments.fs = 16000
 
     T = 200
-    plt.subplot(211)
-    lr.display.specshow(M1[0][:T].transpose(), y_axis='log') 
-    
-    plt.subplot(212)
-    lr.display.specshow(M2[0][:T].transpose(), y_axis='log') 
 
-    fs = 22050
-    lr.output.write_wav('timit_train1.wav', Z[0], fs)
-    lr.output.write_wav('timit_train2.wav', Z[1], fs)
-    lr.output.write_wav('timit_test1.wav', Z[2], fs)
-    lr.output.write_wav('timit_test2.wav', Z[3], fs)
+    if arguments.plot_training:
+        plt.subplot(211)
+        lr.display.specshow(M1[0][:T].transpose(), y_axis='log') 
+        
+        plt.subplot(212)
+        lr.display.specshow(M2[0][:T].transpose(), y_axis='log') 
+
+        fs = arguments.fs
+        lr.output.write_wav('timit_train1_pt.wav', Z[0], fs)
+        lr.output.write_wav('timit_train2_pt.wav', Z[1], fs)
+        lr.output.write_wav('timit_test1_pt.wav', Z[2], fs)
+        lr.output.write_wav('timit_test2_pt.wav', Z[3], fs)
 
     loader1 = form_torch_audio_dataset(M1, P1, lens1, arguments, 'source') 
     loader2 = form_torch_audio_dataset(M2, P2, lens2, arguments, 'source')
     loadermix = form_torch_mixture_dataset(M_t, P_t, 
-                                           M1, M2,  
+                                           M_t1, M_t2,  
                                            [Z[2]], [Z[3]], 
                                            [Z[2].size], [Z[3].size], 
                                            arguments)
@@ -402,7 +446,23 @@ def form_torch_audio_dataset(SPCSabs, SPCSphase, lens, arguments, loadertype):
                                 lens=lens)
     elif loadertype == 'source':
         if arguments.input_type == 'noise':
-            inp = torch.randn(SPCSabs.size(0), SPCSabs.size(1), arguments.L1)
+            if arguments.noise_type == 'gamma': 
+                a, b = 1, 10
+                b = 1/float(b)
+                sz = (SPCSabs.size(0), SPCSabs.size(1), arguments.L1)
+                inp_np = np.random.gamma(a, b, sz)
+                plt.matshow(inp_np.squeeze().transpose()[:, :50])
+                inp = torch.from_numpy(inp_np).float()
+            elif arguments.noise_type == 'bernoulli':
+                sz = (SPCSabs.size(0), SPCSabs.size(1), arguments.L1)
+                mat = (1/float(8))*torch.ones(sz)
+                inp = torch.bernoulli(mat) 
+
+                
+            elif arguments.noise_type == 'gaussian':
+                inp = torch.randn(SPCSabs.size(0), SPCSabs.size(1), arguments.L1)
+            else:
+                raise ValueError('Whaaaat?')
         elif arguments.input_type == 'autoenc':
             inp = SPCSabs
             arguments.L1 = arguments.L2

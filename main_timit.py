@@ -51,6 +51,11 @@ parser.add_argument('--feat_match', type=int, default=0)
 parser.add_argument('--load_models', type=int, default=0)
 parser.add_argument('--adjust_tradeoff', type=int, default=0)
 parser.add_argument('--plot_training', type=int, default=0)
+parser.add_argument('--smooth_source_estimates', type=int, default=0)
+parser.add_argument('--wiener_recons', type=int, default=0)
+parser.add_argument('--noise_type', type=str, default='gaussian')
+parser.add_argument('--clamp_lower', type=float, default=-0.01)
+parser.add_argument('--clamp_upper', type=float, default=0.01)
 
 arguments = parser.parse_args()
 
@@ -64,6 +69,11 @@ np.random.seed(arguments.seed)
 tr_method = arguments.tr_method
 loss = 'Poisson'
 
+#directories = list(ut.list_timit_dirs())
+#Ncombs = len(directories)
+#inds = np.sort(np.random.choice(Ncombs, size=25, replace=False))
+#directories = np.array(directories)[inds]
+
 loader1, loader2, loader_mix = ut.preprocess_timit_files(arguments) 
 
 exp_info = '_'.join([arguments.tr_method,
@@ -71,6 +81,8 @@ exp_info = '_'.join([arguments.tr_method,
                      arguments.data, 
                      arguments.dataname,
                      arguments.input_type, arguments.optimizer, 
+                     'noise_type', arguments.noise_type,
+                     'L1', str(arguments.L1),
                      'feat_match', str(arguments.feat_match),
                      'nfft', str(arguments.n_fft)])
 arguments.exp_info = exp_info
@@ -81,17 +93,26 @@ L2 = arguments.L2
 K = arguments.K
 smooth_output = arguments.smooth_output
 
-generator1 = netG(ngpu, K=K, L1=L1, L2=L2, arguments=arguments)
-generator2 = netG(ngpu, K=K, L1=L1, L2=L2, arguments=arguments)
+if arguments.tr_method == 'ML':
+    generator1 = netG(ngpu, K=K, L1=L1, L2=L2, arguments=arguments)
+    generator2 = netG(ngpu, K=K, L1=L1, L2=L2, arguments=arguments)
+elif arguments.tr_method in ['adversarial', 'adversarial_wasserstein']:
+    generator1 = netG(ngpu, K=K, L1=L1, L2=L2, arguments=arguments)
+    generator2 = netG(ngpu, K=K, L1=L1, L2=L2, arguments=arguments)
+
+    #generator1 = netG_onelayer(ngpu, K=K, L1=L1, L2=L2, arguments=arguments)
+    #generator2 = netG_onelayer(ngpu, K=K, L1=L1, L2=L2, arguments=arguments)
+else:
+    raise ValueError('Whaaaaat?')
 
 discriminator1 = netD(ngpu, K=K, L=L2, arguments=arguments)
 discriminator2 = netD(ngpu, K=K, L=L2, arguments=arguments)
 
 if arguments.cuda:
     generator1.cuda()
-    discriminator1.cuda()
-
     generator2.cuda()
+
+    discriminator1.cuda()
     discriminator2.cuda()
 
 # Train the generative models for the sources
@@ -114,7 +135,8 @@ else:
                             EP=EP,
                             arguments=arguments,
                             criterion=criterion,
-                            conditional_gen=False)
+                            conditional_gen=False,
+                            source_num=1)
 
         adversarial_trainer(loader_mix=loader_mix,
                             train_loader=loader2,
@@ -123,9 +145,28 @@ else:
                             EP=EP,
                             arguments=arguments,
                             criterion=criterion,
-                            conditional_gen=False)
+                            conditional_gen=False,
+                            source_num=2)
 
+    elif tr_method == 'adversarial_wasserstein':
+                
+        adversarial_wasserstein_trainer(loader_mix=loader_mix,
+                                        train_loader=loader1,
+                                        generator=generator1, 
+                                        discriminator=discriminator1, 
+                                        EP=EP,
+                                        arguments=arguments,
+                                        conditional_gen=False,
+                                        source_num=1)
 
+        adversarial_wasserstein_trainer(loader_mix=loader_mix,
+                                        train_loader=loader2,
+                                        generator=generator2, 
+                                        discriminator=discriminator2, 
+                                        EP=EP,
+                                        arguments=arguments,
+                                        conditional_gen=False,
+                                        source_num=2)
 
     elif tr_method == 'ML':
         if loss == 'Euclidean': 
@@ -156,13 +197,28 @@ else:
     ut.save_models([generator1, generator2], [discriminator1, discriminator2], 
                     exp_info, savepath, arguments)
 
+# test the generative models by reconstructing
+for i in range(1,3):
+    reconstruct_tester(generators=[generator1, generator2],
+                       source_num=i,    
+                       loader_mix=loader_mix,
+                       EP=arguments.EP_test,
+                       arguments=arguments,
+                       conditional=False,
+                       tr_method=tr_method,
+                       loss=loss,
+                       exp_info=exp_info)
+pdb.set_trace()
+
+
 
 # Separate out the sources 
 
 if arguments.adjust_tradeoff: 
+    #alpha_range = list(np.linspace(0.01, 4, 10))
     alpha_range = [0] + list(np.logspace(-8, 1, 10, base=2))
 else:
-    alpha_range = [0.0625]
+    alpha_range = [0]*3
 
 bss_evals = []
 for alpha in alpha_range:
@@ -178,16 +234,15 @@ for alpha in alpha_range:
                                          exp_info=exp_info)
     bss_evals.append(bss_eval)
 
-# only save the bss evals here if we adjust the tradeoff parameter
-if arguments.adjust_tradeoff:
-    curdir = os.getcwd()
-    recordspath = os.path.join(curdir, 'records')
-    if not os.path.exists(recordspath):
-        os.mkdir(recordspath)
+# save the bss evals here 
+curdir = os.getcwd()
+recordspath = os.path.join(curdir, 'records')
+if not os.path.exists(recordspath):
+    os.mkdir(recordspath)
 
-    bss_evals_path = os.path.join(recordspath, '_'.join(['bss_evals_all', exp_info]) + '.pk')
-    pickle.dump({'alpha_range': alpha_range, 'bss_evals': bss_evals}, 
-                open(bss_evals_path, 'w')) 
+bss_evals_path = os.path.join(recordspath, '_'.join(['bss_evals_all', exp_info]) + '.pk')
+pickle.dump({'alpha_range': alpha_range, 'bss_evals': bss_evals}, 
+            open(bss_evals_path, 'w')) 
 
 
 # python main.py --optimizer RMSprop --tr_method adversarial --input_type noise --save_files 0 --save_records 0 --L1 512 --EP_train 400 --feat_match 1 --data synthetic_sounds --batch_size 20 --test_method optimize --load_model 0 --adjust_tradeoff 1
