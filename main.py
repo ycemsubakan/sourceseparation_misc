@@ -59,6 +59,7 @@ arguments.cuda = not arguments.no_cuda and torch.cuda.is_available()
 torch.manual_seed(arguments.seed)
 if arguments.cuda:
     torch.cuda.manual_seed(arguments.seed)
+np.random.seed(2)
 
 tr_method = arguments.tr_method
 loss = 'Poisson'
