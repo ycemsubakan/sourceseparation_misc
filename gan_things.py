@@ -158,6 +158,7 @@ class netG_onelayer_sp(nn.Module):
         #output = output + self.b1
         return output
 
+
 class netD(nn.Module):
     def __init__(self, ngpu, **kwargs):
         super(netD, self).__init__()
@@ -165,14 +166,12 @@ class netD(nn.Module):
         self.L = kwargs['L']
         self.K = kwargs['K'] 
         self.arguments = kwargs['arguments']
+        if hasattr(self.arguments, 'pack_num'):
+            self.L = self.arguments.pack_num*self.L
 
         self.l1 = nn.Linear(self.L, self.K, bias=True)
         #initializationhelper(self.l1, 'tanh')
         #self.l1_bn = nn.BatchNorm1d(self.K)
-
-        #self.l2 = nn.Linear(self.K, self.K, bias=True) 
-        #initializationhelper(self.l2, 'relu')
-        #self.l2_bn = nn.BatchNorm1d(self.K)
 
         self.l3 = nn.Linear(self.K, 1, bias=True)
         #initializationhelper(self.l3, 'relu') 
@@ -184,6 +183,12 @@ class netD(nn.Module):
 
         if not (type(inp) == Variable):
             inp = Variable(inp[0])
+
+        if hasattr(self.arguments, 'pack_num'):
+            N = inp.size(0)
+            Ncut = int(N/self.arguments.pack_num)
+            split = torch.split(inp, Ncut, dim=0)
+            inp = torch.cat(split, dim=1)
 
         h1 = F.tanh((self.l1(inp)))
         
@@ -232,6 +237,7 @@ class netG_images(nn.Module):
             output = output.view(-1, self.L2)
         return output
 
+
 class netD_images(nn.Module):
     def __init__(self, ngpu, **kwargs):
         super(netD_images, self).__init__()
@@ -263,8 +269,16 @@ class netD_images(nn.Module):
         
         h2 = F.tanh((self.l2(h1)))
 
-        output = F.sigmoid(self.l3(h2))
+        output = (self.l3(h2))
         return output, h1
+
+def hmc_gan_trainer(loader_mix, train_loader,
+                    generator, discriminator, EP=5,
+                    **kwargs):
+    arguments = kwargs['arguments']
+    conditional_gen = kwargs['conditional_gen']
+    source_num = kwargs['source_num']
+
 
 def adversarial_wasserstein_trainer(loader_mix, train_loader, 
                                     generator, discriminator, EP=5,
@@ -273,6 +287,50 @@ def adversarial_wasserstein_trainer(loader_mix, train_loader,
     conditional_gen = kwargs['conditional_gen']
     source_num = kwargs['source_num']
     
+
+    def drawgendata_toy():
+        samples = out_g.data.cpu().numpy()
+        targets = tar.data.cpu().numpy() 
+
+        npts = 30
+        tol = 17
+        xmin = np.min(arguments.means[:,0]) - tol 
+        xmax = np.max(arguments.means[:,0]) + tol
+        xs = np.linspace(xmin, xmax, npts) 
+
+        ymin = np.min(arguments.means[:,1]) - tol
+        ymax = np.max(arguments.means[:,1]) + tol
+        ys = np.linspace(ymin, ymax, npts)
+        
+        X, Y = np.meshgrid(xs, ys) 
+
+        xy_pairs = torch.from_numpy(np.concatenate([X.reshape(-1, 1), Y.reshape(-1, 1)], 1)).float()
+
+        if hasattr(arguments, 'pack_num'):
+            N = xy_pairs.size(0)
+            Ncut = int(N/arguments.pack_num)
+            xy_pairs = torch.cat([xy_pairs[:Ncut, :], xy_pairs[Ncut:, :]], dim=1)
+        if arguments.cuda:
+            xy_pairs = xy_pairs.cuda()
+        sigmoids, _ = discriminator.forward(Variable(xy_pairs))
+        sigmoids = sigmoids.data.cpu().numpy().reshape(npts, npts) 
+
+        cs = plt.contour(X, Y, sigmoids) 
+        plt.clabel(cs, inline=1, fontsize=9) 
+
+        plt.plot(targets[:, 0], targets[:, 1], 'x', label='True Data')
+        plt.plot(samples[:, 0], samples[:, 1], 'o', label='Generated Data')
+        plt.legend()
+        plt.rc('legend',**{'fontsize':6})
+        plt.title('Situation at iteration {}'.format(ep))
+
+        folder_name = 'toy_example_figures_' + arguments.exp_info
+        if not os.path.exists(folder_name):
+            os.mkdir(folder_name) 
+
+        if 1:
+            plt.savefig(os.path.join(folder_name, 'iter_{}_experiment_{}'.format(ep, arguments.exp_info))) 
+
     def drawgendata_2d():
 
         mode = 'isomap'
@@ -356,11 +414,10 @@ def adversarial_wasserstein_trainer(loader_mix, train_loader,
             else:
                 Diters = 5
 
-
             # sort the tensors within batch
             if arguments.task == 'images' or arguments.task == 'toy_data':
                 tar = tar.contiguous().view(-1, arguments.L2)
-                tar, ft = Variable(tar), Variable(ft)
+                tar, ft = Variable(tar), (ft)
             else:
                 ft, tar = ut.sort_pack_tensors(ft, tar, lens)
 
@@ -377,7 +434,10 @@ def adversarial_wasserstein_trainer(loader_mix, train_loader,
                 err_D_real.backward(one)
 
                 # discriminator gradient with generated data
-                out_g = generator.forward(Variable(ft[0], volatile=True))
+                if arguments.task != 'toy_data':
+                    ft = ft[0]
+
+                out_g = generator.forward(Variable(ft, volatile=True))
                 out_d_g, _ = discriminator.forward(Variable(out_g.data))
                 err_D_fake = out_d_g.mean()
                 err_D_fake.backward(mone)
@@ -399,13 +459,18 @@ def adversarial_wasserstein_trainer(loader_mix, train_loader,
                 else:
                     raise ValueError('Whhhhhaaaaat')
             else:
-                if arguments.plot_training:
+
+                if arguments.plot_training and (ep % 50 == 0):
+                    my_dpi = 96
+                    fig = plt.figure(figsize=(1200/my_dpi, 600/my_dpi), dpi=my_dpi)
+
                     if arguments.task == 'atomic_sourcesep':
-                        if ep % 100 == 0:
-                            my_dpi = 96
-                            fig = plt.figure(figsize=(1200/my_dpi, 600/my_dpi), dpi=my_dpi)
-                            drawgendata_2d()
-                            plt.close(fig)
+                        drawgendata_2d()
+                        plt.close(fig)
+                    elif arguments.task == 'toy_data':
+                        drawgendata_toy()
+                        plt.close(fig)
+
 
             generator_params = list(generator.parameters())
             print(generator_params[0].data.sum())
@@ -413,9 +478,11 @@ def adversarial_wasserstein_trainer(loader_mix, train_loader,
             for p in discriminator.parameters():
                 p.requires_grad = False # to avoid computation
 
+            if ep == 100:
+                pdb.set_trace()
             # generator gradient
             generator.zero_grad()
-            out_g = generator.forward(Variable(ft[0]))
+            out_g = generator.forward(Variable(ft))
             out_d_g, _ = discriminator.forward(out_g)
             err_G = out_d_g.mean()
             err_G.backward(one)
@@ -518,8 +585,8 @@ def adversarial_trainer(loader_mix, train_loader,
                                                                               source_num))) 
 
     def drawgendata_toy():
-        samples = out_g.data.numpy()
-        targets = tar.data.numpy() 
+        samples = out_g.data.cpu().numpy()
+        targets = tar.data.cpu().numpy() 
 
         npts = 30
         tol = 17
@@ -531,14 +598,19 @@ def adversarial_trainer(loader_mix, train_loader,
         ymax = np.max(arguments.means[:,1]) + tol
         ys = np.linspace(ymin, ymax, npts)
         
-        X, Y = np.meshgrid(xs, ys) 
+        #X, Y = np.meshgrid(xs, ys) 
 
-        xy_pairs = torch.from_numpy(np.concatenate([X.reshape(-1, 1), Y.reshape(-1, 1)], 1)).float()
-        sigmoids, _ = discriminator.forward(Variable(xy_pairs))
-        sigmoids = sigmoids.data.numpy().reshape(npts, npts) 
+        #xy_pairs = torch.from_numpy(np.concatenate([X.reshape(-1, 1), Y.reshape(-1, 1)], 1)).float()
+        #if arguments.cuda:
+        #    xy_pairs = xy_pairs.cuda()
+        #pdb.set_trace()
+        #sigmoids, _ = discriminator.forward(Variable(xy_pairs))
 
-        cs = plt.contour(X, Y, sigmoids) 
-        plt.clabel(cs, inline=1, fontsize=9) 
+        #if hasattr(arguments, 'pack_num'):
+        #    sigmoids = sigmoids.data.cpu().numpy().reshape(npts, npts) 
+
+        #cs = plt.contour(X, Y, sigmoids) 
+        #plt.clabel(cs, inline=1, fontsize=9) 
 
         plt.plot(samples[:, 0], samples[:, 1], 'o', label='Generated Data')
         plt.plot(targets[:, 0], targets[:, 1], 'x', label='True Data')
@@ -546,13 +618,14 @@ def adversarial_trainer(loader_mix, train_loader,
         plt.rc('legend',**{'fontsize':6})
         plt.title('Situation at iteration {}'.format(ep))
 
-        folder_name = 'toy_example_figures'
+        folder_name = 'toy_example_figures_' + arguments.exp_info
         if not os.path.exists(folder_name):
             os.mkdir(folder_name) 
 
-        if ep % 10 == 0:
-            pass
-    
+        if 1:
+            plt.savefig(os.path.join(folder_name, 'iter_{}_experiment_{}'.format(ep, arguments.exp_info))) 
+
+
     # end of drawnow function
 
     if arguments.optimizer == 'Adam':
@@ -592,7 +665,9 @@ def adversarial_trainer(loader_mix, train_loader,
                 # discriminator gradient with real data
                 discriminator.zero_grad()
                 out_d, _ = discriminator.forward(tar)
-                labels = Variable(torch.ones(out_d.size(0))*true).squeeze().float()
+                if hasattr(arguments, 'pack_num'):
+                    sz = out_d.size(0)#int(out_d.size(0)/arguments.pack_num)
+                labels = Variable(torch.ones(sz)*true).squeeze().float()
                 if arguments.cuda:
                     labels = labels.cuda()
                 err_D_real = criterion(out_d, labels)
@@ -606,7 +681,7 @@ def adversarial_trainer(loader_mix, train_loader,
 
                 out_g = generator.forward(ft)
                 out_d_g, _ = discriminator.forward(out_g.detach())
-                labels = Variable(torch.ones(out_d.size(0))*false).squeeze().float()
+                labels = Variable(torch.ones(sz)*false).squeeze().float()
                 if arguments.cuda:
                     labels = labels.cuda()
                 err_D_fake = criterion(out_d_g, labels) 
@@ -629,13 +704,17 @@ def adversarial_trainer(loader_mix, train_loader,
                 else:
                     raise ValueError('Whhhhhaaaaat')
             else:
-                if arguments.plot_training:
+                if arguments.plot_training and (ep % 50 == 0):
+                    my_dpi = 96
+                    fig = plt.figure(figsize=(1200/my_dpi, 600/my_dpi), dpi=my_dpi)
+
                     if arguments.task == 'atomic_sourcesep':
-                        if ep % 100 == 0:
-                            my_dpi = 96
-                            fig = plt.figure(figsize=(1200/my_dpi, 600/my_dpi), dpi=my_dpi)
-                            drawgendata_2d()
-                            plt.close(fig)
+                        drawgendata_2d()
+                        plt.close(fig)
+                    elif arguments.task == 'toy_data':
+                        drawgendata_toy()
+                        plt.close(fig)
+
 
             cnt = 1
             for gent_ep in range(1):
@@ -770,6 +849,207 @@ def generative_trainer(loader_mix, train_loader,
             print(err_G)
             print(ep)
 
+def moment_trainer(loader_mix, train_loader, generator, discriminator, EP=5,
+                   **kwargs):
+    arguments = kwargs['arguments']
+    criterion = kwargs['criterion']
+    conditional_gen = kwargs['conditional_gen']
+    source_num = kwargs['source_num']
+ 
+    L1, L2 = generator.L1, generator.L2
+    #K = generator.K
+    def drawgendata():
+        I = 1
+        N = 3 if arguments.task == 'mnist' else 2
+
+        for i in range(I):
+            plt.subplot(N, I, i+1)
+            plt.imshow(out_g[i].view(arguments.nfts, arguments.T).data.numpy())
+
+            plt.subplot(N, I, I+i+1) 
+            plt.imshow(tar[i].view(arguments.nfts, arguments.T).data.numpy())
+
+            if arguments.task == 'mnist':
+                plt.subplot(N, I, 2*I+i+1) 
+                plt.imshow(ft[i].view(arguments.nfts, arguments.T).numpy())
+    def drawgendata_atomic():
+        I = 1
+        N = 2 
+        
+        genspec = out_g.data.numpy().transpose()[:, :200]
+        target = tar[0].numpy().transpose()[:, :200]
+
+        #genspec = out_g[].data.numpy().transpose()
+        #target = tar.permute(0,2,1).contiguous().view(-1, L2).numpy().transpose()
+        for i in range(I):
+                        
+            plt.subplot(N, I, i+1)
+            lrd.specshow(genspec, y_axis='log', x_axis='time') 
+            
+            plt.subplot(N, I, i+2) 
+            lrd.specshow(target, y_axis='log', x_axis='time')
+
+    def drawgendata_2d():
+
+        mode = 'isomap'
+        
+        all_data = torch.cat([tar[0], out_g.data], 0) 
+        all_data_numpy = all_data.cpu().numpy()
+        N = all_data.size()[0]
+
+        disc_values, _ = discriminator.forward(Variable(all_data)) 
+        disc_values = disc_values.data.cpu().numpy()
+        disc_vals_real = disc_values[:N/2]
+        disc_vals_fake = disc_values[(N/2):]
+
+        lowdim_out = ut.dim_red(all_data_numpy, 2, mode)
+        #lowdim_data = ut.dim_red(tar.data.numpy(), 2, mode)
+
+        plt.subplot2grid((2,2),(0,0)) 
+        ss = 1
+        
+        sc = plt.scatter(lowdim_out[:(N/2):ss, 0], lowdim_out[:(N/2):ss, 1], c=disc_vals_real[::ss], marker='o', vmin=0, vmax=1)
+        sc = plt.scatter(lowdim_out[N/2::ss, 0], lowdim_out[N/2::ss, 1], c=disc_vals_fake[::ss], marker='x', vmin=0, vmax=1)
+    
+        plt.colorbar(sc)
+        plt.title('Scatter plot of real vs generated data')
+        
+        plt.subplot2grid((2, 2), (0, 1))
+        plt.hist2d(lowdim_out[:N/2, 0], lowdim_out[:N/2:,1], bins=100,
+                   norm=colors.LogNorm())
+        plt.colorbar()
+        plt.plot(lowdim_out[N/2:, 0], lowdim_out[N/2:, 1], 'rx', label='generated data')
+        plt.title('Histogram of training data vs generated data')
+        plt.legend()
+        
+        plt.subplot2grid((2,2), (1, 0), colspan=2)
+        genspec = out_g.data.cpu().numpy().transpose()[:, :200]
+        lrd.specshow(genspec, y_axis='log', x_axis='time') 
+
+        plt.suptitle('Situation at iteration {}'.format(ep))
+        #plt.scatter(lowdim_out[::10, 0], lowdim_out[::10, 1], c=disc_values[::10]) 
+
+        folder_name = 'figures_' + arguments.exp_info
+        if not os.path.exists(folder_name):
+            os.mkdir(folder_name) 
+
+        if 1:
+            plt.savefig(os.path.join(folder_name, 'iter_{}, source_{}'.format(ep, 
+                                                                              source_num))) 
+
+    def drawgendata_toy():
+        samples = out_g.data.cpu().numpy()
+        targets = tar.data.cpu().numpy() 
+
+        npts = 30
+        tol = 17
+        xmin = np.min(arguments.means[:,0]) - tol 
+        xmax = np.max(arguments.means[:,0]) + tol
+        xs = np.linspace(xmin, xmax, npts) 
+
+        ymin = np.min(arguments.means[:,1]) - tol
+        ymax = np.max(arguments.means[:,1]) + tol
+        ys = np.linspace(ymin, ymax, npts)
+        
+        X, Y = np.meshgrid(xs, ys) 
+
+        xy_pairs = torch.from_numpy(np.concatenate([X.reshape(-1, 1), Y.reshape(-1, 1)], 1)).float()
+        if arguments.cuda:
+            xy_pairs = xy_pairs.cuda()
+        sigmoids, _ = discriminator.forward(Variable(xy_pairs))
+        sigmoids = sigmoids.data.cpu().numpy().reshape(npts, npts) 
+
+        #cs = plt.contour(X, Y, sigmoids) 
+        #plt.clabel(cs, inline=1, fontsize=9) 
+
+        plt.plot(samples[:, 0], samples[:, 1], 'o', label='Generated Data')
+        plt.plot(targets[:, 0], targets[:, 1], 'x', label='True Data')
+        plt.legend()
+        plt.rc('legend',**{'fontsize':6})
+        plt.title('Situation at iteration {}'.format(ep))
+
+        folder_name = 'toy_example_figures_' + arguments.exp_info
+        if not os.path.exists(folder_name):
+            os.mkdir(folder_name) 
+
+        if 1:
+            plt.savefig(os.path.join(folder_name, 'iter_{}_experiment_{}'.format(ep, arguments.exp_info))) 
+
+
+    # end of drawnow function
+
+    if arguments.optimizer == 'Adam':
+        optimizerD = optim.Adam(discriminator.parameters(), lr=arguments.lr, betas=(0.9, 0.999))
+        optimizerG = optim.Adam(generator.parameters(), lr=arguments.lr, betas=(0.9, 0.999))
+    elif arguments.optimizer == 'RMSprop':
+        optimizerD = optim.RMSprop(discriminator.parameters(), lr=arguments.lr)
+        optimizerG = optim.RMSprop(generator.parameters(), lr=arguments.lr)
+    else:
+        raise ValueError('Whaaaat?')
+
+    if not arguments.cuda and arguments.plot_training:
+        my_dpi = 96
+        plt.figure(figsize=(1200/my_dpi, 600/my_dpi), dpi=my_dpi)
+    true, false = 1, 0
+    for ep in range(EP):
+        for (ft, tar, lens), mix in zip(train_loader, loader_mix):
+            if arguments.cuda:
+                ft = ft.cuda()
+                tar = tar.cuda()
+                lens = lens.cuda()
+                #mix = mix.cuda()
+
+            # sort the tensors within batch
+            if arguments.task == 'images' or arguments.task == 'toy_data':
+                tar = tar.contiguous().view(-1, arguments.L2)
+                tar, ft = Variable(tar, volatile = False), Variable(ft)
+            else:
+                ft, tar = ut.sort_pack_tensors(ft, tar, lens)
+
+            generator.zero_grad()
+
+            out_g = generator.forward(ft)
+        
+            tar_mean = tar.mean(0)
+            gen_mean = out_g.mean(0)
+
+            tar_cov = torch.mm((tar - tar_mean).permute(1, 0), (tar - tar_mean))/tar.size(0)
+            gen_cov = torch.mm((out_g - gen_mean).permute(1, 0), (out_g - gen_mean))/tar.size(0)
+
+            errG = torch.mean(torch.abs(gen_cov - tar_cov)) + \
+                   torch.mean(torch.abs(tar_mean - gen_mean))
+            errG.backward()
+
+            optimizerG.step()
+
+
+            # show the current generated output
+            if not arguments.cuda:
+                if arguments.task == 'atomic_sourcesep':
+                    if ep % 100 == 0:
+                        drawnow(drawgendata_atomic)
+                        drawnow(drawgendata_2d) 
+                elif arguments.task == 'images':
+                    drawnow(drawgendata)
+                elif arguments.task == 'toy_data':
+                    drawnow(drawgendata_toy)
+                else:
+                    raise ValueError('Whhhhhaaaaat')
+            else:
+                if arguments.plot_training and (ep % 50 == 0):
+                    my_dpi = 96
+                    fig = plt.figure(figsize=(1200/my_dpi, 600/my_dpi), dpi=my_dpi)
+
+                    if arguments.task == 'atomic_sourcesep':
+                        drawgendata_2d()
+                        plt.close(fig)
+                    elif arguments.task == 'toy_data':
+                        drawgendata_toy()
+                        plt.close(fig)
+
+            # generator gradient
+            print(errG.mean())
+            print(ep)
 
 
 def VAE_trainer(loader_mix, train_loader, 

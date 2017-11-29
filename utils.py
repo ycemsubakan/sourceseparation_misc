@@ -40,13 +40,13 @@ def list_timit_dirs():
 def prepare_mixture_gm_data(arguments):
     dataset = []
     
-    num_means = 1
     arguments.L2 = 2
     arguments.L1 = 2
-    arguments.K = 50
+    arguments.K = 200
     sig0 = 5
     sig = 0.1
 
+    num_means = arguments.num_means
     means = 5*torch.randn(num_means, arguments.L2) 
     arguments.means = means.numpy()
 
