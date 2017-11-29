@@ -7,7 +7,7 @@
 * In all cases if the argument --tr_method adversarial is used, the training is done adversarially, if --tr_method ML is used, maximum likelihood training is used. 
 	* main_toy_examples.py  - This main file is used to generate generate data from mixture of K spherical gaussian distributions. Example usage is: 
 
-```python
+```
 python main_toy_examples.py --task toy_data --tr_method adversarial --EP_train 3000 --num_means 4 --optimizer RMSprop
 ```
 These options would use the standard GAN training (tr_method) to train for 3000 iterations (EP_train), on a mixture of 4 gaussian (num_means), with RMSprop optimizer. 
