@@ -6,6 +6,7 @@
 	* main_timit_multiplefiles.py - This file to recreate our experiments in the paper, which implements separation with multiple speaker pairs.
 * In all cases if the argument --tr_method adversarial is used, the training is done adversarially, if --tr_method ML is used, maximum likelihood training is used. 
 	* main_toy_examples.py  - This main file is used to generate generate data from mixture of K spherical gaussian distributions. Example usage is: 
+	* records/read_records_timit_cleaned.py - You can use this script to plot your results obtained with 'main_timit_multiplefiles.py', in order to generate a figure similar to results figure in the paper. 
 
 ```
 python main_toy_examples.py --task toy_data --tr_method adversarial --EP_train 3000 --num_means 4 --optimizer RMSprop
