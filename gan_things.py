@@ -18,20 +18,117 @@ import librosa as lr
 import librosa.display as lrd
 import utils as ut
 import itertools as it
+import copy
 
 def initializationhelper(param, nltype):
     
-    c = 0.1 
-    torchinit.uniform(param.weight, a=-c, b=c)
+    c = 1
+    #torchinit.uniform(param.weight, a=-c, b=c)
+    #torchinit.eye(param.weight)
 
     #torchinit.xavier_uniform(param.weight, gain=c*torchinit.calculate_gain(nltype))
-    c = 0.1
-    torchinit.uniform(param.bias, a=-c, b=c)
+    #torchinit.uniform(param.bias, a=-c, b=c)
+    #torchinit.eye(param.bias)
+
+class Normalizing_Flow(nn.Module):
+    def __init__(self, ngpu, c=0.01, out='relu', **kwargs):
+        super(Normalizing_Flow, self).__init__()
+
+        self.L2 = kwargs['L2']
+        self.L1 = kwargs['L1']
+        self.nlayers = kwargs['nlayers']
+        self.arguments = kwargs['arguments']
+        self.out = out
+
+        ws = [nn.Parameter(c*torch.randn(self.L2)) if nl > 0 else \
+              nn.Parameter(c*torch.randn(self.L1)) for nl in range(self.nlayers)]
+        self.ws = nn.ParameterList(ws) 
+
+        us = [nn.Parameter(c*torch.randn(self.L2)) for nl in range(self.nlayers)]
+        self.us = nn.ParameterList(us)
+
+        bs = [nn.Parameter(c*torch.randn(1)) for nl in range(self.nlayers)]
+        self.bs = nn.ParameterList(bs)
+
+    def forward_layer1(self, h):
+                
+        for nl in range(self.nlayers):
+           mat = Variable(torch.eye(h.size(1))) + (self.us[nl].unsqueeze(1)*self.ws[nl].unsqueeze(0)) 
+           h = torch.matmul(mat, h.permute(1,0)) + self.us[nl].unsqueeze(1)*self.bs[nl]
+           h = h.permute(1,0) 
+        return h 
+
+    def forward_layer2(self, h):
+        
+        for nl in range(self.nlayers):
+            temp = (torch.matmul(self.ws[nl].unsqueeze(0), h.permute(1,0))) 
+            h = h + self.us[nl].unsqueeze(0)*temp.permute(1,0) + self.us[nl].unsqueeze(0)*self.bs[nl]
+        return h
 
 
-class VAE(nn.Module):
+    def forward(self, h):
+        
+        #out1 = self.forward_layer1(h)
+        out2 = self.forward_layer2(h)
+        if self.out == 'relu':
+            return F.relu(out2)
+        else:
+            return out2
+       
+    def inv_forward(self, x):
+        eps = 1e-10
+        if self.out == 'relu':
+            mask = torch.gt(x, 0).float()
+            h = mask*x + (1-mask)*(-100) #(100*x)
+            #h = torch.log(x.exp() - 1 + eps)
+        else:
+            h = x
+
+        det = 0
+        for nl in range(self.nlayers-1, -1, -1):
+            h_mbias = h - self.bs[nl]*self.us[nl].unsqueeze(0)
+            temp = h_mbias.mm(self.ws[nl].unsqueeze(1)) 
+            inner_prod = torch.sum(self.us[nl]*self.ws[nl])
+            #print('layer {} value = {}'.format(nl, inner_prod.data[0]))
+            temp = (self.us[nl].unsqueeze(0)*temp) / (1 + inner_prod) 
+            h = h_mbias - temp
+            
+            det = det + torch.log(torch.abs(1 + inner_prod))
+      
+        mismatch = (x.data  - self.forward(h).data).abs().sum()
+        print(mismatch)
+        h_prev = h
+
+        #h = x
+        #det = 0 
+        #for nl in range(self.nlayers-1, -1, -1):
+        #    h_mbias = (h - self.bs[nl]*self.us[nl].unsqueeze(0)).permute(1,0)
+        #    inner_prod = torch.sum(self.us[nl]*self.ws[nl])
+
+        #    mat = Variable(torch.eye(h.size(1))) + (self.us[nl].unsqueeze(1)*self.ws[nl].unsqueeze(0)) 
+        #    inv_mat = Variable(torch.eye(h.size(1))) - (self.us[nl].unsqueeze(1)*self.ws[nl].unsqueeze(0))/(1+inner_prod)
+
+        #    h = torch.matmul(inv_mat, h_mbias).permute(1,0)
+        #    det = det + torch.log(torch.abs(1 + inner_prod))
+        #h_prev2 = h
+
+        #mismatch = (x.data  - self.forward(h_prev2).data).abs().sum()
+        #print(mismatch)
+
+
+        return h, det, mismatch
+
+    def compute_density_normal(self, x, mu=0, sigma=1):
+        h, detterm, mismatch = self.inv_forward(x)
+
+
+        log_density = -detterm  - ((h - mu)**2/(2*sigma**2)).sum(1) 
+
+        return log_density, torch.exp(log_density), mismatch
+    
+class VAE_nf(nn.Module):
     def __init__(self, ngpu, **kwargs):
-        super(VAE, self).__init__()
+        super(VAE_nf, self).__init__()
 
         self.L1 = kwargs['L1']
         self.L2 = kwargs['L2']
@@ -47,13 +144,78 @@ class VAE(nn.Module):
         self.fc22 = nn.Linear(self.K, self.arguments.Kdisc)
         initializationhelper(self.fc22, 'relu')
 
-        self.fc3 = nn.Linear(self.arguments.Kdisc, self.L2)
-        initializationhelper(self.fc3, 'relu')
+        self.fc3 = Normalizing_Flow(1, L1=self.arguments.Kdisc,
+                                    L2=self.arguments.L2, 
+                                    nlayers=self.arguments.flow_layers,
+                                    arguments=self.arguments)
+        #initializationhelper(self.fc3, 'relu')
+
+        #self.fc4 = nn.Linear(self.arguments.K, self.L2)
+        #initializationhelper(self.fc4, 'relu')
+
 
 
     def encode(self, x):
 
-        h1 = F.relu(self.fc1(x))
+        h1 = F.tanh(self.fc1(x))
+        return self.fc21(h1), self.fc22(h1)
+
+    def reparameterize(self, mu, logvar):
+        if self.training:
+          std = logvar.mul(0.5).exp_()
+          eps = Variable(std.data.new(std.size()).normal_())
+          return mu + eps.mul(std).add_(mu) # Variable(torch.randn(mu.size()))  #
+        else:
+          return mu
+
+    def decode(self, z):
+        z1 = (self.fc3(z))
+        return z1
+
+    def forward(self, inp):
+        if not (type(inp) == Variable):
+            inp = Variable(inp[0])
+
+        mu, logvar = self.encode(inp)
+        h = self.reparameterize(mu, logvar)
+
+        #print('mean of mu {} variance of mu {}'.format(torch.mean(h).data[0], torch.var(h).data[0]))
+        if self.arguments.out_type == 'noise':
+            return self.decode(h), mu, logvar, h
+        elif self.arguments.out_type == 'implicit':
+            hhat, logdet, _ = self.fc3.inv_forward(inp)
+            return hhat, mu, logvar, h, logdet, self.decode(h)
+
+
+class VAE(nn.Module):
+    def __init__(self, ngpu, **kwargs):
+        super(VAE, self).__init__()
+
+        self.L1 = kwargs['L1']
+        self.L2 = kwargs['L2']
+        self.K = kwargs['K']
+        self.arguments = kwargs['arguments']
+
+        self.fc1 = nn.Linear(self.L1, self.K)
+        #initializationhelper(self.fc1, 'relu')
+
+        self.fc21 = nn.Linear(self.K, self.arguments.Kdisc)
+        #initializationhelper(self.fc21, 'relu')
+
+        self.fc22 = nn.Linear(self.K, self.arguments.Kdisc)
+        #initializationhelper(self.fc22, 'relu')
+
+        self.fc3 = nn.Linear(self.arguments.Kdisc, self.arguments.K)
+        #initializationhelper(self.fc3, 'relu')
+
+        self.fc4 = nn.Linear(self.arguments.K, self.L2)
+        #initializationhelper(self.fc4, 'relu')
+
+
+
+    def encode(self, x):
+
+        h1 = F.tanh(self.fc1(x))
         return self.fc21(h1), self.fc22(h1)
 
     def reparameterize(self, mu, logvar):
@@ -65,7 +227,8 @@ class VAE(nn.Module):
           return mu
 
     def decode(self, z):
-        return F.softplus(self.fc3(z))
+        z1 = F.tanh(self.fc3(z))
+        return (self.fc4(z1))
 
     def forward(self, inp):
         
@@ -73,8 +236,10 @@ class VAE(nn.Module):
             inp = Variable(inp[0])
 
         mu, logvar = self.encode(inp)
-        z = self.reparameterize(mu, logvar)
-        return self.decode(z), mu, logvar
+        h = self.reparameterize(mu, logvar)
+
+        print('mean of mu {} variance of mu {}'.format(torch.mean(h).data[0], torch.var(h).data[0]))
+        return self.decode(h), mu, logvar, h
 
 class netG(nn.Module):
     def __init__(self, ngpu, **kwargs):
@@ -100,8 +265,8 @@ class netG(nn.Module):
         #if inp.dim() > 2:
         #    inp = inp.permute(0, 2, 1)
         #inp = inp.contiguous().view(-1, self.L1)
-        if not (type(inp) == Variable):
-            inp = Variable(inp[0])
+        #if not (type(inp) == Variable):
+        #    inp = Variable(inp[0])
 
         if self.arguments.tr_method in ['adversarial', 'adversarial_wasserstein']:
             h = F.softplus((self.l1(inp)))
@@ -181,25 +346,49 @@ class netD(nn.Module):
         #    inp = inp.permute(0, 2, 1)
         #inp = inp.contiguous().view(-1, self.L) 
 
-        if not (type(inp) == Variable):
-            inp = Variable(inp[0])
+        #if not (type(inp) == Variable):
+        #    inp = Variable(inp[0])
 
-        if hasattr(self.arguments, 'pack_num'):
-            N = inp.size(0)
-            Ncut = int(N/self.arguments.pack_num)
-            split = torch.split(inp, Ncut, dim=0)
-            inp = torch.cat(split, dim=1)
+        #if hasattr(self.arguments, 'pack_num'):
+        #    N = inp.size(0)
+        #    Ncut = int(N/self.arguments.pack_num)
+        #    split = torch.split(inp, Ncut, dim=0)
+        #    inp = torch.cat(split, dim=1)
 
         h1 = F.tanh((self.l1(inp)))
         
-        #h2 = F.tanh(self.l2_bn(self.l2(h1)))
-
         if self.arguments.tr_method == 'adversarial_wasserstein':
             output = (self.l3(h1))
         else:
             output = F.sigmoid(self.l3(h1))
 
         return output, h1
+
+class netD_images(nn.Module):
+    def __init__(self, ngpu, **kwargs):
+        super(netD, self).__init__()
+        self.ngpu = ngpu
+        self.L = kwargs['L']
+        self.K = kwargs['K'] 
+        self.arguments = kwargs['arguments']
+        if hasattr(self.arguments, 'pack_num'):
+            self.L = self.arguments.pack_num*self.L
+
+        self.l1 = nn.Linear(self.L, 1, bias=True)
+        
+    def forward(self, inp):
+        
+        if not (type(inp) == Variable):
+            inp = Variable(inp[0])
+
+        if self.arguments.tr_method == 'adversarial_wasserstein':
+            output = (self.l1(inp))
+        else:
+            output = F.sigmoid(self.l1(inp))
+
+        return output, None
+
+
 
 class netG_images(nn.Module):
     def __init__(self, ngpu, **kwargs):
@@ -228,7 +417,7 @@ class netG_images(nn.Module):
         if not (type(inp) == Variable):
             inp = Variable(inp[0])
 
-        h = F.relu(self.l1(inp))
+        h = F.tanh(self.l1(inp))
         output = (self.l2(h))
 
         if self.smooth_output:
@@ -272,12 +461,374 @@ class netD_images(nn.Module):
         output = (self.l3(h2))
         return output, h1
 
+def initialize_v(M, J, model, arguments):
+    vs = []
+    for m in range(M):
+        v = []
+        for j in range(J):
+            temp = []
+            for p in model[m][j].parameters():    
+                if arguments.cuda:
+                    temp.append(Variable(torch.randn(p.size()).cuda()))
+                else:
+                    temp.append(Variable(torch.randn(p.size())))
+            v.append(temp)
+        vs.append(v)
+    return vs
+
+def initialize_v_gibbs(M, model, arguments):
+    vs = []
+    for m in range(M):
+        temp = []
+        for p in model[m].parameters():    
+            if arguments.cuda:
+                temp.append(Variable(torch.randn(p.size()).cuda()))
+            else:
+                temp.append(Variable(torch.randn(p.size())))
+        vs.append(temp)
+    return vs
+
+
+def gibbs_gan_trainer(loader_mix, train_loader,
+                      generator, discriminator, EP=5,
+                      **kwargs):
+    arguments = kwargs['arguments']
+    criterion = kwargs['criterion']
+    conditional_gen = kwargs['conditional_gen']
+    source_num = kwargs['source_num']
+
+    M = 1 
+    al = 0.9
+    eta = 0.001
+    nf = 0
+
+    # initialize generators and discriminators
+    discs = []
+    gens = [] 
+
+    for m in range(M):
+        if arguments.cuda:
+            discs.append(netD(1, K=arguments.K, L1=arguments.L1, L=arguments.L2, arguments=arguments).cuda())
+            gens.append(netG_images(1, K=arguments.K, L1=arguments.L1, L2=arguments.L2, arguments=arguments).cuda()) 
+        else:
+            discs.append(netD(1, K=arguments.K, L1=arguments.L1, L=arguments.L2, arguments=arguments))
+            gens.append(netG_images(1, K=arguments.K, L1=arguments.L1, L2=arguments.L2, arguments=arguments))
+
+    # allocate v's
+    vgens = initialize_v_gibbs(M, gens, arguments)
+    vdiscs = initialize_v_gibbs(M, discs, arguments) 
+   
+    gen_EP = 1
+    disc_EP = 10
+
+    true, false = 1, 0
+    for ep in range(EP):
+        for (ft, tar, lens), mix in zip(train_loader, loader_mix):
+            if arguments.cuda:
+                ft = ft.cuda()
+                tar = tar.cuda()
+                lens = lens.cuda()
+                #mix = mix.cuda()
+
+            # sort the tensors within batch
+            if arguments.task == 'images' or arguments.task == 'toy_data':
+                tar = tar.contiguous().view(-1, arguments.L2)
+                tar, ft = Variable(tar), Variable(ft)
+            else:
+                ft, tar = ut.sort_pack_tensors(ft, tar, lens)
+
+            for m in range(M):
+               gens[m].zero_grad() 
+
+               labels = Variable(torch.ones(tar.size(0)))
+               if arguments.cuda:
+                   labels = labels.cuda()
+               for e in range(gen_EP):
+                    gens[m].zero_grad()
+                    out_g = gens[m].forward(ft)
+                    out_d, _ = discs[m].forward(out_g)  
+
+                    errd_fake = criterion(out_d.squeeze(), labels)
+                    errd_fake.backward()
+
+                    for k, p in enumerate(gens[m].parameters()): 
+                         vgens[m][k] = vgens[m][k]*(1-al) - eta*p.grad 
+                         vr = float(np.sqrt(2*al*eta))*nf
+                         if arguments.cuda:
+                             vgens[m][k] = vgens[m][k] + Variable(vr*torch.randn(p.size()).cuda())   
+                         else:
+                             vgens[m][k] = vgens[m][k] + Variable(vr*torch.randn(p.size()))   
+                         
+                         # some debugging here 
+                         old_data = copy.deepcopy(p.data)
+
+                         p.data.copy_((vgens[m][k]+p).data)
+
+                         assert 1-torch.equal(list(gens[m].parameters())[k].data, old_data), 'not assigning things'
+
+               # update discriminator 
+               labels_true = Variable(torch.ones(tar.size(0)))
+               labels_false = Variable(torch.zeros(tar.size(0)))
+               if arguments.cuda:
+                   labels_true = labels_true.cuda()
+                   labels_false = labels_false.cuda()
+
+               for e in range(disc_EP):
+                    discs[m].zero_grad()
+                    out_g = gens[m].forward(ft)
+                    out_d, _ = discs[m].forward(out_g)  
+                    errd_fake = criterion(out_d.squeeze(), labels_false)
+
+                    out_d_true, _ = discs[m].forward(tar)
+                    errd_real = criterion(out_d_true.squeeze(), labels_true)
+                   
+                    err_d = errd_fake + errd_real
+                    err_d.backward()
+
+                    for k, p in enumerate(discs[m].parameters()): 
+                         vdiscs[m][k] = vdiscs[m][k]*(1-al) - eta*p.grad 
+                         vr = float(np.sqrt(2*al*eta))*nf
+                         if arguments.cuda:
+                             vdiscs[m][k] = vdiscs[m][k] + Variable(vr*torch.randn(p.size()).cuda())   
+                         else:
+                             vdiscs[m][k] = vdiscs[m][k] + Variable(vr*torch.randn(p.size()))   
+                         
+                         # some debugging here 
+                         old_data2 = copy.deepcopy(p.data)
+
+                         p.data.copy_((vdiscs[m][k]+p).data)
+
+                         assert 1-torch.equal(list(discs[m].parameters())[k].data, old_data2), 'not assigning things'
+
+
+                   
+        
+        if ep % 10 == 0:
+
+            npts = 30
+            tol = 30
+            xmin = np.min(arguments.means[:,0]) - tol 
+            xmax = np.max(arguments.means[:,0]) + tol
+            xs = np.linspace(xmin, xmax, npts) 
+
+            ymin = np.min(arguments.means[:,1]) - tol
+            ymax = np.max(arguments.means[:,1]) + tol
+            ys = np.linspace(ymin, ymax, npts)
+            
+            X, Y = np.meshgrid(xs, ys) 
+
+            xy_pairs = torch.from_numpy(np.concatenate([X.reshape(-1, 1), Y.reshape(-1, 1)], 1)).float()
+            if arguments.cuda:
+                xy_pairs = xy_pairs.cuda()
+            sigmoids, _ = discs[0].forward(Variable(xy_pairs))
+            sigmoids = sigmoids.data.cpu().numpy().reshape(npts, npts)
+
+            cs = plt.contour(X, Y, sigmoids) 
+            plt.clabel(cs, inline=1, fontsize=9) 
+
+            tardat = tar.data.cpu().numpy()
+            plt.plot(tardat[:, 0], tardat[:, 1], 'o')
+
+            all_samples = out_g.data.cpu().numpy()
+            all_sigs = out_d.data.cpu().numpy().squeeze()
+            plt.scatter(all_samples[:, 0], all_samples[:, 1], c=all_sigs)
+            
+            plt.legend()
+            plt.rc('legend',**{'fontsize':6})
+            plt.title('Situation at iteration {}'.format(ep))
+
+            folder_name = 'toy_example_figures_' + arguments.exp_info
+            if not os.path.exists(folder_name):
+                os.mkdir(folder_name) 
+
+            if 1:
+                plt.savefig(os.path.join(folder_name, 'iter_{}_experiment_{}'.format(ep, arguments.exp_info))) 
+                plt.close()
+            
+            print('EP [{}/{}] Errg {}, out_d {}'.format(ep, EP, 
+                                                        errd_fake.data[0], 
+                                                        out_d.mean().data[0]))
+
+
 def hmc_gan_trainer(loader_mix, train_loader,
                     generator, discriminator, EP=5,
                     **kwargs):
     arguments = kwargs['arguments']
+    criterion = kwargs['criterion']
     conditional_gen = kwargs['conditional_gen']
     source_num = kwargs['source_num']
+
+    Jg = 5
+    Jd = 1
+    M = 2 
+
+    # initialize generators and discriminators
+    discs = []
+    gens = [] 
+
+    if arguments.cuda:
+        for m in range(M): 
+            discs.append([netD(1, K=arguments.K, L1=arguments.L1, L=arguments.L2, arguments=arguments).cuda() for j in range(Jd)])
+            gens.append([netG_images(1, K=arguments.K, L1=arguments.L1, L2=arguments.L2, arguments=arguments).cuda() for j in range(Jg)]) 
+    else:
+        for m in range(M): 
+            discs.append([netD(1, K=arguments.K, L1=arguments.L1, L=arguments.L2, arguments=arguments) for j in range(Jd)])
+            gens.append([netG_images(1, K=arguments.K, L1=arguments.L1, L2=arguments.L2, arguments=arguments) for j in range(Jg)]) 
+
+    # allocate v's
+    vgens = initialize_v(M, Jg, gens, arguments)
+    vdiscs = initialize_v(M, Jd, discs, arguments) 
+
+    al = 0.9 
+    eta = 0.001
+    nf = 0.1
+
+    true, false = 1, 0
+    for ep in range(EP):
+        for (ft, tar, lens), mix in zip(train_loader, loader_mix):
+            if arguments.cuda:
+                ft = ft.cuda()
+                tar = tar.cuda()
+                lens = lens.cuda()
+                #mix = mix.cuda()
+
+            # sort the tensors within batch
+            if arguments.task == 'images' or arguments.task == 'toy_data':
+                tar = tar.contiguous().view(-1, arguments.L2)
+                tar, ft = Variable(tar), Variable(ft)
+            else:
+                ft, tar = ut.sort_pack_tensors(ft, tar, lens)
+
+            
+            for m in range(M):
+                for i in range(Jg):
+                    gens[m][i].zero_grad() 
+
+                    errg = 0 
+                    for j in range(Jd):
+                        sz = ft.size(0)*Jg
+
+                        labels = Variable(torch.ones(sz)*true).squeeze().float()
+                        if arguments.cuda:
+                            labels = labels.cuda()
+                            h = torch.randn(sz, ft.size(1)).cuda()
+                        else:
+                            h = torch.randn(sz, ft.size(1))
+
+                        out_g = gens[m][i].forward(Variable(h))
+                        out_d, _ = discs[m][j].forward(out_g)  
+
+                        errg = errg + criterion(out_d, labels)
+                    errg.backward()
+
+                    for k, p in enumerate(gens[m][i].parameters()): 
+                        vgens[m][i][k] = -vgens[m][i][k]*(1-al) - eta*p.grad 
+                        vr = float(np.sqrt(2*al*eta))*nf
+                        if arguments.cuda:
+                            vgens[m][i][k] = vgens[m][i][k] + Variable(vr*torch.randn(p.size()).cuda())   
+                        else:
+                            vgens[m][i][k] = vgens[m][i][k] + Variable(vr*torch.randn(p.size()))   
+
+                        p.data.copy_((vgens[m][i][k]+p).data)
+
+                        assert torch.equal(list(gens[m][i].parameters())[k].data, p.data), 'not assigning things'
+
+            # discriminator updates
+            for m in range(M): 
+                for i in range(Jd):
+                    discs[m][i].zero_grad()  
+                   
+                    sz = tar.size(0)
+                    labels = Variable(torch.ones(sz)*true).squeeze().float()
+                    if arguments.cuda:
+                        labels = labels.cuda()
+
+                    out_d_real, _ = discs[m][i].forward(tar)
+                    errd_real = criterion(out_d_real, labels)
+
+                    errd_fake = 0 
+                    for j in range(Jg):
+                        sz = ft.size(0)*Jd
+
+                        labels = Variable(torch.ones(sz)*false).squeeze().float()
+                        if arguments.cuda:
+                            labels = labels.cuda()
+                            h = torch.randn(sz, ft.size(1)).cuda()
+                        else:
+                            h = torch.randn(sz, ft.size(1))
+
+                        out_g = gens[m][j].forward(Variable(h))
+                        out_d_fake, _ = discs[m][i].forward(out_g)  
+
+                        errd_fake = errd_fake + criterion(out_d_fake, labels)
+                    errd_fake = errd_fake/Jg
+                    errd = errd_real + errd_fake
+
+                    errd.backward()
+
+                    for k, p in enumerate(discs[m][i].parameters()): 
+                        vdiscs[m][i][k] = -vdiscs[m][i][k]*(1-al) - eta*p.grad 
+                        vr = float(np.sqrt(2*al*eta))*nf
+                        if arguments.cuda:
+                            vdiscs[m][i][k] = vdiscs[m][i][k] + Variable(vr*torch.randn(p.size()).cuda())   
+                        else:
+                            vdiscs[m][i][k] = vdiscs[m][i][k] + Variable(vr*torch.randn(p.size()))   
+
+                        p.data.copy_((vdiscs[m][i][k]+p).data)
+
+                        assert torch.equal(list(discs[m][i].parameters())[k].data, p.data), 'not assigning things'
+
+            print('EP[{}/{}], errD = {}, errG = {} '.format(ep, EP, errd.data[0], errg.data[0]))
+
+        if (ep % 100) == 0:
+            sz = 1000
+            if arguments.cuda:
+                h = torch.randn(sz, ft.size(1)).cuda()
+            else:
+                h = torch.randn(sz, ft.size(1))
+
+            samples = []
+            probs = []
+            for m in range(M): 
+                for i in range(Jg):
+                    sample = gens[m][i].forward(Variable(h))
+                    samples.append(sample)    
+                    prob, _ = discs[m][0].forward(sample)
+                    probs.append(prob)
+
+            all_samples = torch.cat(samples, dim=0).data.cpu().numpy()
+            all_probs = torch.cat(probs, dim=1) / torch.cat(probs, dim=1).sum(1, keepdim=True) 
+            all_pr_cat = torch.cat(probs, dim=0).data.cpu().numpy()
+            gannum = torch.multinomial(all_probs)
+
+            for i, samp in enumerate(samples):
+                samples[i] = samp.unsqueeze(2)
+            sample_tensor = torch.cat(samples, dim=2).data
+            selected_tensor = torch.zeros(sz, arguments.L2)
+
+            for i, gn in enumerate(gannum.data):
+                selected_tensor[i] = sample_tensor[i, :, gn[0]]
+            selected_tensor = selected_tensor.cpu().numpy()
+
+
+            tardat = tar.data.cpu().numpy()
+            plt.plot(tardat[:, 0], tardat[:, 1], 'o')
+
+            plt.scatter(all_samples[:, 0], all_samples[:, 1], c=all_pr_cat.squeeze())
+            plt.plot(selected_tensor[:, 0], selected_tensor[:, 1], 'v')
+            
+            
+            plt.legend()
+            plt.rc('legend',**{'fontsize':6})
+            plt.title('Situation at iteration {}'.format(ep))
+
+            folder_name = 'toy_example_figures_' + arguments.exp_info
+            if not os.path.exists(folder_name):
+                os.mkdir(folder_name) 
+
+            if 1:
+                plt.savefig(os.path.join(folder_name, 'iter_{}_experiment_{}'.format(ep, arguments.exp_info))) 
+                plt.close()
 
 
 def adversarial_wasserstein_trainer(loader_mix, train_loader, 
@@ -421,22 +972,26 @@ def adversarial_wasserstein_trainer(loader_mix, train_loader,
             else:
                 ft, tar = ut.sort_pack_tensors(ft, tar, lens)
 
+            if arguments.task != 'toy_data':
+                ft = ft[0]
+                tar = tar[0]
+
             for disc_ep in range(Diters):
                 
                 for p in discriminator.parameters():
                     p.data.clamp_(arguments.clamp_lower, 
                                   arguments.clamp_upper)
 
+
                 # discriminator gradient with real data
                 discriminator.zero_grad()
                 out_d, _ = discriminator.forward(tar)
+
                 err_D_real = out_d.mean()
                 err_D_real.backward(one)
 
                 # discriminator gradient with generated data
-                if arguments.task != 'toy_data':
-                    ft = ft[0]
-
+                
                 out_g = generator.forward(Variable(ft, volatile=True))
                 out_d_g, _ = discriminator.forward(Variable(out_g.data))
                 err_D_fake = out_d_g.mean()
@@ -603,7 +1158,6 @@ def adversarial_trainer(loader_mix, train_loader,
         #xy_pairs = torch.from_numpy(np.concatenate([X.reshape(-1, 1), Y.reshape(-1, 1)], 1)).float()
         #if arguments.cuda:
         #    xy_pairs = xy_pairs.cuda()
-        #pdb.set_trace()
         #sigmoids, _ = discriminator.forward(Variable(xy_pairs))
 
         #if hasattr(arguments, 'pack_num'):
@@ -650,7 +1204,8 @@ def adversarial_trainer(loader_mix, train_loader,
                 #mix = mix.cuda()
 
             # sort the tensors within batch
-            if arguments.task == 'images' or arguments.task == 'toy_data':
+            if arguments.task == 'images' or arguments.task == 'toy_data' \
+               or arguments.task == 'toy_spectrogram':
                 tar = tar.contiguous().view(-1, arguments.L2)
                 tar, ft = Variable(tar), Variable(ft)
             else:
@@ -1051,24 +1606,70 @@ def moment_trainer(loader_mix, train_loader, generator, discriminator, EP=5,
             print(errG.mean())
             print(ep)
 
+def propose_parameters(generator1, generator2, st):
+    for p1, p2 in zip(generator1.parameters(), generator2.parameters()):
+        p1.data.copy_(p2.data + st*torch.randn(p2.data.size()))
 
-def VAE_trainer(loader_mix, train_loader, 
-                generator, EP = 5,
-                **kwargs):
+def assign_parameters(generator1, generator2):
+    for p1, p2 in zip(generator1.parameters(), generator2.parameters()):
+        p1.data.copy_(p2.data) 
+
+def VAE_trainer_MC(loader_mix, train_loader,
+                   generator, EP = 5, 
+                   **kwargs):
+
+    def plot_VAE():
+        if ep % 1 == 0:
+            plt.subplot(1,2,1)
+            tardat = tar.data.cpu().numpy()
+            plt.plot(tardat[:, 0], tardat[:, 1], 'o')
+
+            all_samples = out_g.data.cpu().numpy()
+            plt.plot(all_samples[:, 0], all_samples[:, 1], 'x')
+            
+            plt.legend()
+            plt.rc('legend',**{'fontsize':6})
+            plt.title('Situation at iteration {}'.format(ep))
+
+            if 0:
+                folder_name = 'toy_example_figures_' + arguments.exp_info
+                if not os.path.exists(folder_name):
+                    os.mkdir(folder_name) 
+
+                plt.savefig(os.path.join(folder_name, 'iter_{}_experiment_{}'.format(ep, arguments.exp_info))) 
+
+            plt.subplot(1,2,2)
+            if hgen.size(1) == 1:
+                hnp = hgen.data.cpu().numpy()
+                plt.hist(hnp,50)
+            elif hgen.size(1) == 2:
+                hnp = hgen.data.cpu().numpy()
+                plt.plot(hnp[:,0], hnp[:,1],'o')
+            plt.title('p(h|x)')
+
+
+        if ep == EP-1:
+            plt.subplot(1,2,1)
+            h = torch.randn(2000, generator.arguments.Kdisc)
+            gendata = generator.decode(Variable(h))
+            gendata = gendata.data.cpu().numpy()
+            plt.plot(gendata[:, 0], gendata[:, 1], 'v', label='test_gen')
+            plt.legend()
+            pdb.set_trace()
+
     arguments = kwargs['arguments']
     criterion = kwargs['criterion']
     conditional_gen = kwargs['conditional_gen']
 
-    generator.train()
 
     L1 = generator.L1
     L2 = generator.L2
     K = generator.K
 
-    if arguments.optimizer == 'Adam':
-        optimizerG = optim.Adam(generator.parameters(), lr=arguments.lr, betas=(0.9, 0.999))
-    elif arguments.optimizer == 'RMSprop':
-        optimizerG = optim.RMSprop(generator.parameters(), lr=arguments.lr)
+    generator_proposal = VAE(1, K=K, L1=L1, L2=L2, arguments=arguments)
+
+    generator.train(mode=True)
+    generator_proposal.train(mode=True)
 
     if not arguments.cuda and arguments.plot_training:
         figure(figsize=(4,4))
@@ -1080,32 +1681,182 @@ def VAE_trainer(loader_mix, train_loader,
                 ft = ft.cuda()
                 lens = lens.cuda()
 
-            # sort the tensors within batch
-            if arguments.task == 'images':
+            if arguments.task == 'images' or arguments.task == 'toy_data':
                 tar = tar.contiguous().view(-1, arguments.L2)
                 tar, ft = Variable(tar), Variable(ft)
             else:
                 ft, tar = ut.sort_pack_tensors(ft, tar, lens)
-                tar = Variable(tar[0])
 
-            #if conditional_gen: 
-            #    inp = mix.contiguous().view(-1, L)
-            #else:
-            #    inp = ft_rshape   # fixed_noise.contiguous().view(-1, L)
+            out_g, mu, logvar, hgen = generator.forward(tar)
+            err_G = criterion(out_g, tar, mu, logvar)
+
+            propose_parameters(generator_proposal, generator, 0.003)
+
+            out_g_proposed, mu, logvar, h = generator_proposal.forward(tar)
+            err_G_proposal = criterion(out_g_proposed, tar, mu, logvar)
+
+            drawnow(plot_VAE)
+            if err_G_proposal.data[0] < err_G.data[0]: 
+                params1 = list(generator.parameters())[0]
+                params2 = list(generator_proposal.parameters())[0]
+
+
+                assign_parameters(generator, generator_proposal)
+                print('[{}/{}] accept!, errG {}, errG_proposal {}'.format(ep, EP,
+                                                                        err_G.data[0],
+                                                                        err_G_proposal.data[0]))
+                params1 = list(generator.parameters())
+                params2 = list(generator_proposal.parameters())
+
+                
+            else:
+                print('[{}/{}] reject!, errG {}, errG_proposal {}'.format(ep, EP,
+                                                                        err_G.data[0],
+                                                                        err_G_proposal.data[0]))
+
+
+
+def VAE_trainer(loader_mix, train_loader, 
+                generator, EP = 5,
+                **kwargs):
+
+    def drawgendata():
+        I = 3
+        N = 2
+
+        for i in range(I):
+            plt.subplot(N, I, i+1)
+            img = out_g[i].data.contiguous().view(arguments.nfts, arguments.T)
+            plt.imshow(img.numpy())
+
+            plt.subplot(N, I, I+i+1) 
+            plt.imshow(tar[i].data.view(arguments.nfts, arguments.T).numpy())
+
+            
+    def plot_VAE():
+        if ep % 1 == 0:
+            plt.subplot(1,2,1)
+            tardat = tar.data.cpu().numpy()
+            plt.plot(tardat[:, 0], tardat[:, 1], 'o', label='target')
+
+            all_samples = out_g.data.cpu().numpy()
+            plt.plot(all_samples[:, 0], all_samples[:, 1], 'x', label='train_gen')
+
+            if arguments.out_type == 'implicit':
+                mu_forward = generator.fc3.forward(mu).data.cpu().numpy()
+            #plt.plot(mu_forward[:, 0], mu_forward[:, 1], 'v', label='means')
+
+            #hgen = torch.randn(2000, generator.arguments.Kdisc)
+            gendata = generator.decode((h))
+            gendata = gendata.data.cpu().numpy()
+            #plt.plot(gendata[:, 0], gendata[:, 1], 'v', label='test_gen')
+
+            plt.legend()
+            plt.rc('legend',**{'fontsize':6})
+            plt.title('Situation at iteration {}'.format(ep))
+
+            if 0:
+                folder_name = 'toy_example_figures_' + arguments.exp_info
+                if not os.path.exists(folder_name):
+                    os.mkdir(folder_name) 
+
+                plt.savefig(os.path.join(folder_name, 'iter_{}_experiment_{}'.format(ep, arguments.exp_info))) 
+
+            plt.subplot(1,2,2)
+            hnp = h.data.cpu().numpy()
+            if h.size(1) == 1:
+                plt.hist(hnp,50)
+            elif h.size(1) == 2:
+                plt.plot(hnp[:,0], hnp[:,1],'o', label='h forward')
+                if arguments.out_type == 'implicit':
+                    hhatnp = hhat.data.cpu().numpy()
+                    munp = mu.data.cpu().numpy()
+                    plt.plot(hhatnp[:,0], hhatnp[:,1], 'o', label='hhat backward')
+                    plt.plot(munp[:, 0], munp[:,1], 'v', label='mu forward')
+
+            else: 
+                end = 100
+                plt.imshow(hnp[:end],interpolation='None')
+            plt.title('p(h|x)')
+            plt.legend()
+        # generate some data and show
+        if ep == EP-1:
+            plt.subplot(1,2,1)
+            #hgen = torch.randn(2000, generator.arguments.Kdisc)
+            gendata = generator.decode(h)
+            gendata = gendata.data.cpu().numpy()
+            #plt.plot(gendata[:, 0], gendata[:, 1], 'v', label='test_gen')
+            plt.legend()
+
+            root = os.path.expanduser('~')
+            path = os.path.join(root, 'Dropbox', 'GANs', 'BayesGAN', 'linear_mm.eps')
+            plt.savefig(path, format='eps')
+
+            pdb.set_trace()
+
+    arguments = kwargs['arguments']
+    criterion = kwargs['criterion']
+    conditional_gen = kwargs['conditional_gen']
+
+    generator.train(mode=True)
+
+    L1 = generator.L1
+    L2 = generator.L2
+    K = generator.K
+
+    if arguments.optimizer == 'Adam':
+        optimizerG = optim.Adam(generator.parameters(), lr=arguments.lr, betas=(0.9, 0.999))
+    elif arguments.optimizer == 'RMSprop':
+        optimizerG = optim.RMSprop(generator.parameters(), lr=arguments.lr)
+    elif arguments.optimizer == 'SGD':
+        optimizerG = optim.SGD(generator.parameters(), lr=arguments.lr)
+    elif arguments.optimizer == 'LBFGS':
+        optimizerG = optim.LBFGS(generator.parameters(), lr=arguments.lr)
+
+
+    if not arguments.cuda and arguments.plot_training:
+        plt.figure(num=None, figsize=(20, 10), dpi=80, facecolor='w', edgecolor='k')
+    true, false = 1, 0
+    for ep in range(EP):
+        for (ft, tar, lens), mix in zip(train_loader, loader_mix):
+            if arguments.cuda:
+                tar = tar.cuda()
+                ft = ft.cuda()
+                lens = lens.cuda()
+
+            if arguments.task == 'images' or arguments.task == 'toy_data':
+                tar = tar.contiguous().view(-1, arguments.L2)
+                tar, ft = Variable(tar), Variable(ft)
+            else:
+                ft, tar = ut.sort_pack_tensors(ft, tar, lens)
 
             # generator gradient
             generator.zero_grad()
-            out_g, mu, logvar = generator.forward(ft)
-            err_G = criterion(out_g, tar, mu, logvar)
+            if arguments.out_type == 'noise':
+                out_g, mu, logvar, h = generator.forward(tar)
+                err_G = criterion(out_g, tar, mu, logvar)
+            elif arguments.out_type == 'implicit':
+                hhat, mu, logvar, h, logdet, out_g = generator.forward(tar)
+                err_G = criterion(hhat, logdet, mu, logvar, tar)
+
             err_G.backward()
+
+            param_norms = []
+            for p in generator.parameters():
+                param_norms.append(p.data.abs().mean())
 
             # step 
             optimizerG.step()
+            print('EP [{}/{}, error = {}]'.format(ep, EP, 
+                                                  err_G.data[0])) 
 
-            print(err_G)
-            print(ep)
+            
+            if arguments.task == 'toy_data':
+                drawnow(plot_VAE)
+            else:
+                drawnow(drawgendata)
 
-
+                                                                                    
 
 def reconstruct_tester(generators, source_num, 
                        loader_mix, EP, **kwargs):
